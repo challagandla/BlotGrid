@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+.vendor/
+.*
+!.gitignore
+smoke_plot.png
+
+# Local development context and instruction artifacts are never published.
+*prompt*.md
+*PROMPT*.md
+*training*.md
+*TRAINING*.md
+*instructions*.md
+*INSTRUCTIONS*.md
+*agent*.md
+*AGENT*.md
+*assistant*.md
+*ASSISTANT*.md

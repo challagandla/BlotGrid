@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="editor-shell">
+    <div class="lock-banner">ROI-size lock ON — resizing one rectangle updates every measurement rectangle on this blot.</div>
+    <div id="canvas-viewport" class="canvas-viewport">
+      <canvas id="roi-canvas" tabindex="0" aria-label="Interactive blot ROI editor"></canvas>
+    </div>
+    <div id="roi-status" class="status">Click a rectangle to select it.</div>
+    <div class="help">Drag inside to move · drag a handle to resize all ROIs · arrow keys nudge 1 px · Alt + arrows resize all by 1 px · drag the panel's bottom-right corner to make the blot area taller</div>
+  </div>
+  <script src="roi_editor.js"></script>
+</body>
+</html>

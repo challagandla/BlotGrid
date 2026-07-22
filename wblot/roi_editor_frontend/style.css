@@ -1,0 +1,83 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.editor-shell {
+  width: 100%;
+  padding: 2px 1px 0;
+}
+
+.lock-banner {
+  margin: 0 0 7px;
+  padding: 7px 10px;
+  border: 1px solid #7dd3fc;
+  border-radius: 7px;
+  background: #e0f2fe;
+  color: #075985;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+/* The blot lives in its own scroll box so that zooming in pans instead of
+   pushing the status line and the controls below it off the screen. `resize`
+   gives the panel a native drag handle for making the blot area taller. */
+.canvas-viewport {
+  overflow: auto;
+  max-width: 100%;
+  min-height: 120px;
+  border: 1px solid #94a3b8;
+  border-radius: 4px;
+  background: #fff;
+  resize: vertical;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  background: #fff;
+  outline: none;
+  touch-action: none;
+  cursor: default;
+}
+
+/* The canvas owns a high-DPI backing surface. Image pixels are controlled
+   independently in JavaScript so the blot can stay faithful while ROI lines
+   remain anti-aliased instead of inheriting pixelated CSS scaling. */
+
+.canvas-viewport:focus-within {
+  box-shadow: 0 0 0 2px #38bdf8;
+}
+
+.status {
+  min-height: 19px;
+  margin-top: 6px;
+  color: #0f172a;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.help {
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .lock-banner { background: #082f49; color: #bae6fd; border-color: #0369a1; }
+  .status { color: #e2e8f0; }
+  .help { color: #94a3b8; }
+  .canvas-viewport { background: #0f172a; border-color: #475569; }
+  canvas { background: #0f172a; }
+}

@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">BlotGrid workflow</title>
+  <desc id="desc">Five steps: upload a blot, straighten it, review detected bands, quantify intensity, and export results.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#020617" flood-opacity="0.35"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#67e8f9"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="420" rx="28" fill="url(#background)"/>
+  <text x="48" y="62" fill="#f8fafc" font-family="Arial, sans-serif" font-size="32" font-weight="700">BlotGrid</text>
+  <text x="48" y="94" fill="#bae6fd" font-family="Arial, sans-serif" font-size="17">From raw scan to reviewable, export-ready measurements</text>
+
+  <g stroke="#67e8f9" stroke-width="4" fill="none" marker-end="url(#arrow)" opacity="0.9">
+    <path d="M 232 239 H 270"/>
+    <path d="M 462 239 H 500"/>
+    <path d="M 692 239 H 730"/>
+    <path d="M 922 239 H 960"/>
+  </g>
+
+  <g font-family="Arial, sans-serif" filter="url(#shadow)">
+    <g transform="translate(40 130)">
+      <rect width="192" height="220" rx="20" fill="#f8fafc"/>
+      <rect x="28" y="26" width="136" height="72" rx="10" fill="#e2e8f0" stroke="#64748b" stroke-width="2"/>
+      <path d="M 48 73 C 66 46, 86 92, 104 63 S 140 78, 151 52" fill="none" stroke="#0f172a" stroke-width="7" stroke-linecap="round"/>
+      <circle cx="40" cy="37" r="7" fill="#22d3ee"/>
+      <text x="96" y="133" text-anchor="middle" fill="#0f172a" font-size="20" font-weight="700">1 · Upload</text>
+      <text x="96" y="162" text-anchor="middle" fill="#475569" font-size="14">TIFF, PNG, or JPG</text>
+      <text x="96" y="184" text-anchor="middle" fill="#475569" font-size="14">Labels optional</text>
+    </g>
+
+    <g transform="translate(270 130)">
+      <rect width="192" height="220" rx="20" fill="#f8fafc"/>
+      <g transform="translate(31 27) rotate(-4 65 36)">
+        <rect width="130" height="72" rx="8" fill="#e2e8f0"/>
+        <path d="M 12 24 H 118 M 12 48 H 118 M 32 8 V 64 M 65 8 V 64 M 98 8 V 64" stroke="#06b6d4" stroke-width="2"/>
+        <path d="M 20 36 H 110" stroke="#0f172a" stroke-width="8" stroke-linecap="round"/>
+      </g>
+      <text x="96" y="133" text-anchor="middle" fill="#0f172a" font-size="20" font-weight="700">2 · Straighten</text>
+      <text x="96" y="162" text-anchor="middle" fill="#475569" font-size="14">Estimate scan angle</text>
+      <text x="96" y="184" text-anchor="middle" fill="#475569" font-size="14">Fine-tune on the grid</text>
+    </g>
+
+    <g transform="translate(500 130)">
+      <rect width="192" height="220" rx="20" fill="#f8fafc"/>
+      <rect x="28" y="27" width="136" height="72" rx="8" fill="#e2e8f0"/>
+      <path d="M 43 52 H 82 M 109 52 H 149 M 43 78 H 82 M 109 78 H 149" stroke="#0f172a" stroke-width="8" stroke-linecap="round"/>
+      <g fill="none" stroke-width="3">
+        <rect x="36" y="39" width="53" height="26" rx="4" stroke="#16a34a"/>
+        <rect x="102" y="39" width="54" height="26" rx="4" stroke="#f97316"/>
+        <rect x="36" y="65" width="53" height="26" rx="4" stroke="#16a34a"/>
+        <rect x="102" y="65" width="54" height="26" rx="4" stroke="#16a34a"/>
+      </g>
+      <text x="96" y="133" text-anchor="middle" fill="#0f172a" font-size="20" font-weight="700">3 · Review</text>
+      <text x="96" y="162" text-anchor="middle" fill="#475569" font-size="14">Move or resize ROIs</text>
+      <text x="96" y="184" text-anchor="middle" fill="#475569" font-size="14">Add missed bands</text>
+    </g>
+
+    <g transform="translate(730 130)">
+      <rect width="192" height="220" rx="20" fill="#f8fafc"/>
+      <path d="M 39 94 V 45 M 72 94 V 66 M 105 94 V 35 M 138 94 V 55" stroke="#2563eb" stroke-width="20"/>
+      <path d="M 27 99 H 158" stroke="#64748b" stroke-width="3"/>
+      <text x="96" y="133" text-anchor="middle" fill="#0f172a" font-size="20" font-weight="700">4 · Quantify</text>
+      <text x="96" y="162" text-anchor="middle" fill="#475569" font-size="14">Subtract background</text>
+      <text x="96" y="184" text-anchor="middle" fill="#475569" font-size="14">Normalize if available</text>
+    </g>
+
+    <g transform="translate(960 130)">
+      <rect width="192" height="220" rx="20" fill="#f8fafc"/>
+      <path d="M 56 30 H 126 L 148 52 V 102 H 56 Z" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+      <path d="M 126 30 V 53 H 148 M 73 68 H 132 M 73 84 H 118" stroke="#2563eb" stroke-width="3"/>
+      <path d="M 96 111 V 78 M 81 94 L 96 111 L 111 94" fill="none" stroke="#16a34a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="96" y="133" text-anchor="middle" fill="#0f172a" font-size="20" font-weight="700">5 · Export</text>
+      <text x="96" y="162" text-anchor="middle" fill="#475569" font-size="14">Figures and tables</text>
+      <text x="96" y="184" text-anchor="middle" fill="#475569" font-size="14">Keep an audit trail</text>
+    </g>
+  </g>
+</svg>
