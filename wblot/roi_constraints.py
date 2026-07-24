@@ -31,8 +31,11 @@ def enforce_shared_size(
 ) -> None:
     """Enforce exactly one width/height pair for the entire blot."""
     for roi in rois:
+        old_geometry = (roi.get("x"), roi.get("y"), roi.get("w"), roi.get("h"))
         resize_centered(
             roi, shared_size["w"], shared_size["h"], image_width, image_height)
+        if old_geometry != (roi["x"], roi["y"], roi["w"], roi["h"]):
+            roi["annotation_approved"] = False
 
 
 def apply_editor_event(
@@ -68,6 +71,8 @@ def apply_editor_event(
         except (KeyError, TypeError, ValueError):
             return False
         shared_size.update(w=width, h=height)
+        for roi in rois:
+            roi["annotation_approved"] = False
 
     changed = False
     for roi in rois:
@@ -85,7 +90,10 @@ def apply_editor_event(
         roi.update(x=x, y=y, w=incoming_w, h=incoming_h)
         resize_centered(
             roi, shared_size["w"], shared_size["h"], image_width, image_height)
-        changed = changed or old_geometry != (roi["x"], roi["y"], roi["w"], roi["h"])
+        geometry_changed = old_geometry != (roi["x"], roi["y"], roi["w"], roi["h"])
+        if geometry_changed:
+            roi["annotation_approved"] = False
+        changed = changed or geometry_changed
 
     enforce_shared_size(rois, shared_size, image_width, image_height)
     return changed

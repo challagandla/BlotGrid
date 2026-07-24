@@ -7,4 +7,6 @@ pandas>=2.0
 matplotlib>=3.7
 openpyxl>=3.1
 rapidocr==3.9.2
-onnxruntime>=1.27,<2
+# Ubuntu 22.04 ships Python 3.10; ONNX Runtime 1.27+ requires Python 3.11.
+onnxruntime>=1.23.2,<1.24; python_version < "3.11"
+onnxruntime>=1.27,<2; python_version >= "3.11"

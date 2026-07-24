@@ -1,5 +1,7 @@
 """Unit tests for the densitometry and normalization math."""
 import io
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
@@ -7,6 +9,32 @@ from openpyxl import load_workbook
 
 from wblot import (alignment, detection, image_io, densitometry, normalization, stats,
                    project_io, roi_constraints, excel_export, label_ocr)
+
+
+def test_ocr_uses_installed_package_models_when_vendor_bundle_is_absent():
+    with TemporaryDirectory() as tmp:
+        params = label_ocr._ocr_params(Path(tmp))
+
+    assert params == {"Global.log_level": "warning"}
+
+
+def test_ocr_prefers_complete_offline_vendor_bundle():
+    with TemporaryDirectory() as tmp:
+        model_dir = Path(tmp) / "rapidocr" / "models"
+        model_dir.mkdir(parents=True)
+        for name in (
+            "PP-OCRv6_det_small.onnx",
+            "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+            "PP-OCRv6_rec_small.onnx",
+        ):
+            (model_dir / name).touch()
+
+        params = label_ocr._ocr_params(Path(tmp))
+
+    assert params["Global.log_level"] == "warning"
+    assert set(params) == {
+        "Global.log_level", "Det.model_path", "Cls.model_path", "Rec.model_path",
+    }
 
 
 def test_alignment_estimates_and_corrects_a_skewed_blot():
@@ -249,12 +277,16 @@ def test_compare_groups_labels_match_groups():
 def test_project_round_trip_from_bytes():
     state = {"targets": ["Insig", "GAPDH"], "lanes": ["WT", "KO"],
              "control": "GAPDH", "bands_dark": True,
+             "alignment_applied": {"blot1.tif": -1.2},
+             "image_provenance": {"blot1.tif": {"sha256": "abc123"}},
              "layouts": {"blot1.tif": {"band_width": 40, "lane_x": [80, 180],
                                        "targets": {"Insig": {"y": 60, "h": 20}}}}}
     raw = project_io.project_json(state).encode("utf-8")
     back = project_io.load_project(raw)          # as uploaded bytes, not a path
     assert back["targets"] == ["Insig", "GAPDH"]
     assert back["layouts"]["blot1.tif"]["lane_x"] == [80, 180]
+    assert back["alignment_applied"]["blot1.tif"] == -1.2
+    assert back["image_provenance"]["blot1.tif"]["sha256"] == "abc123"
     assert "_saved_at" in back
 
 
@@ -441,9 +473,12 @@ def test_auto_detection_ignores_panel_borders_and_right_side_labels():
 
 def test_roi_editor_server_guard_enforces_one_blot_size():
     rois = [
-        {"roi_id": "a", "lane": "L1", "x": 10, "y": 10, "w": 20, "h": 10},
-        {"roi_id": "b", "lane": "L1", "x": 10, "y": 40, "w": 20, "h": 10},
-        {"roi_id": "c", "lane": "L2", "x": 60, "y": 10, "w": 20, "h": 10},
+        {"roi_id": "a", "lane": "L1", "x": 10, "y": 10, "w": 20, "h": 10,
+         "annotation_approved": True},
+        {"roi_id": "b", "lane": "L1", "x": 10, "y": 40, "w": 20, "h": 10,
+         "annotation_approved": True},
+        {"roi_id": "c", "lane": "L2", "x": 60, "y": 10, "w": 20, "h": 10,
+         "annotation_approved": True},
     ]
     shared_size = {"w": 20, "h": 10}
 
@@ -458,8 +493,11 @@ def test_roi_editor_server_guard_enforces_one_blot_size():
     }
     assert roi_constraints.apply_editor_event(rois, shared_size, malicious_move, 120, 100)
     assert {(roi["w"], roi["h"]) for roi in rois} == {(20, 10)}
+    assert not rois[0]["annotation_approved"]
 
     # A legitimate handle resize changes the shared lane size, never one band.
+    for roi in rois:
+        roi["annotation_approved"] = True
     resize = {
         "action": "resize", "selected_id": "a",
         "rois": [
@@ -471,6 +509,7 @@ def test_roi_editor_server_guard_enforces_one_blot_size():
     assert roi_constraints.apply_editor_event(rois, shared_size, resize, 120, 100)
     assert shared_size == {"w": 34, "h": 16}
     assert {(roi["w"], roi["h"]) for roi in rois} == {(34, 16)}
+    assert not any(roi["annotation_approved"] for roi in rois)
 
 
 def test_excel_export_is_in_memory_and_sanitizes_invalid_values():

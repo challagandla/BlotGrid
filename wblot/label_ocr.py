@@ -338,27 +338,30 @@ def _ocr_engine():
         raise OCRUnavailable(
             "Local OCR is unavailable. Install rapidocr and onnxruntime, then retry label recognition."
         ) from exc
-    # Pin every model to the vendored on-disk copy. Passing explicit paths
-    # bypasses RapidOCR's optional model downloader and guarantees that label
-    # recognition never needs a network connection.
+    params = _ocr_params(vendor)
+    try:
+        return RapidOCR(params=params)
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise OCRUnavailable(f"Local OCR could not start: {exc}") from exc
+
+
+def _ocr_params(vendor: Path) -> dict[str, str]:
+    """Use an offline vendor bundle when present, otherwise package models.
+
+    RapidOCR ships its default small models in the installed wheel.  A clean
+    source checkout therefore remains fully local after ``pip install`` even
+    though the optional project-local ``.vendor`` directory is git-ignored.
+    """
     model_dir = vendor / "rapidocr" / "models"
     model_paths = {
         "Det.model_path": model_dir / "PP-OCRv6_det_small.onnx",
         "Cls.model_path": model_dir / "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
         "Rec.model_path": model_dir / "PP-OCRv6_rec_small.onnx",
     }
-    missing = [path.name for path in model_paths.values() if not path.is_file()]
-    if missing:
-        raise OCRUnavailable(
-            "Local OCR model files are missing: " + ", ".join(missing)
-        )
-    try:
-        return RapidOCR(params={
-            **{key: str(path) for key, path in model_paths.items()},
-            "Global.log_level": "warning",
-        })
-    except (ImportError, OSError, RuntimeError) as exc:
-        raise OCRUnavailable(f"Local OCR could not start: {exc}") from exc
+    params = {"Global.log_level": "warning"}
+    if all(path.is_file() for path in model_paths.values()):
+        params.update({key: str(path) for key, path in model_paths.items()})
+    return params
 
 
 def read_experiment_labels(image: image_io.LoadedImage) -> ExperimentLabels:

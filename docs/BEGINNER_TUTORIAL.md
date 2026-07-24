@@ -7,22 +7,22 @@ programming experience is required.
 
 ## 1. Install BlotGrid
 
-Install Python 3.10, 3.11, or 3.12 from [python.org](https://www.python.org/downloads/).
-On Windows, select **Add Python to PATH** during installation.
-
-Download this repository, unzip it, and open a terminal inside the BlotGrid
-folder. Install the required packages once:
+On Ubuntu 22.04 or newer, open a terminal inside the BlotGrid folder and run:
 
 ```bash
-python -m pip install -r requirements.txt
+sudo apt update
+sudo apt install -y python3 python3-venv
+./scripts/setup_ubuntu.sh
 ```
+
+This creates an isolated `.venv`; it does not alter Ubuntu's system Python.
 
 ## 2. Start the app
 
 Run:
 
 ```bash
-python -m streamlit run app.py
+./run_blotgrid.sh
 ```
 
 BlotGrid should open in your web browser. If it does not, visit
@@ -137,7 +137,8 @@ Keeping both makes the analysis easier to audit later.
 
 ### The command `streamlit` is not found
 
-Use `python -m streamlit run app.py` instead.
+Run `./scripts/setup_ubuntu.sh`, then use `./run_blotgrid.sh`. The launcher calls
+Streamlit from BlotGrid's own `.venv`.
 
 ### Automatic detection misses a band
 

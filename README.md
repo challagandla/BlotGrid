@@ -8,19 +8,55 @@ A local Streamlit app to quantify Western blot bands from an image, optionally
 normalize each target against a housekeeping/loading control **in the same lane**,
 aggregate replicates, and export publication-quality bar charts.
 
-[Beginner tutorial](docs/BEGINNER_TUTORIAL.md) · [MIT license](LICENSE)
+[Beginner tutorial](docs/BEGINNER_TUTORIAL.md) ·
+[Pretrained model workflow](docs/PRETRAINED_MODELS.md) ·
+[Third-party data](THIRD_PARTY_DATA.md) ·
+[MIT license](LICENSE)
 
 ![BlotGrid workflow](docs/blotgrid-workflow.svg)
 
-## Install & run
+## Ubuntu install & run
 
 ```bash
-pip install -r requirements.txt          # once
-python make_sample_blot.py               # optional: makes sample_blot.tif to try
-streamlit run app.py
+sudo apt update
+sudo apt install -y python3 python3-venv
+./scripts/setup_ubuntu.sh
+./run_blotgrid.sh
 ```
 
-The app opens in your browser. No command line needed after launch.
+The launcher uses an isolated `.venv` and keeps caches inside the project. The
+app opens at `http://localhost:8501`; no command line is needed after launch.
+To create the optional demo image first, run `.venv/bin/python
+make_sample_blot.py`.
+
+The original code is Python/Streamlit and does not depend on Windows APIs.
+Ubuntu-specific setup, a local OCR-model fallback, and version-compatible ONNX
+Runtime dependencies are included here.
+
+### Optional pretrained detection
+
+BlotGrid can run the verified Apache-2.0 GelGenie Universal ONNX model and
+optionally use SAM 2.1 to recenter one selected ROI:
+
+```bash
+./scripts/setup_ubuntu.sh --with-ml
+.venv/bin/python scripts/download_pretrained_models.py \
+  --model gelgenie-universal
+
+# Optional SAM-assisted ROI refinement:
+./scripts/setup_ubuntu.sh --with-sam2 --ml-runtime cu118
+.venv/bin/python scripts/download_pretrained_models.py \
+  --model sam2.1-hiera-small
+```
+
+The installer chooses a tested CUDA 11.8 build when `nvidia-smi` is available
+and otherwise installs the CPU build. See the
+[pretrained model workflow](docs/PRETRAINED_MODELS.md) for GelGenie/SAM setup
+and application use.
+
+AI changes only the proposed ROI locations. BlotGrid still measures
+background-corrected intensity from the original native-depth pixels with its
+auditable classical densitometry.
 
 ## Workflow (tabs, left to right)
 
@@ -59,7 +95,9 @@ The app opens in your browser. No command line needed after launch.
    resize all rectangles by one pixel. Numeric Width/Height controls and the
    X/Y table remain available for exact adjustments. An intensity-profile panel
    shows the vertical interval used for measurement. An evenly spaced manual grid
-   is available as a fallback.
+   is available as a fallback. Reviewed boxes can be explicitly approved as
+   training annotations; changing pixels, geometry, labels, or ROI inclusion
+   clears whole-image approval.
 3. **Quantify** — runs densitometry (integrated density with background subtraction);
    flags saturated bands and non-positive signals. Profile-guided integration is
    the default: it retains the locked lane width but integrates only the dominant
@@ -134,8 +172,9 @@ units rather than a misleading normalized value.
 
 The sidebar's **Save project (.json)** button writes labels, ROI layouts,
 replicate numbers and all measurement settings. **Load project** + **Restore
-project** brings them back; re-upload the images (matched back to their layout by
-file name) and re-run Quantify. Images are not embedded in the JSON.
+project** brings them back; re-upload the images and re-run Quantify. Images are
+not embedded in the JSON. Saved SHA-256 identities must match before a restored
+layout is applied; a same-named different image is rejected.
 
 ## Layout
 
@@ -150,14 +189,28 @@ wblot/
   stats.py             replicate aggregation, t-test / ANOVA
   plotting.py          publication bar chart builder
   project_io.py        save/load project JSON
+  ml_detector.py       optional TorchVision ROI proposals and checkpoint provenance
+  ml_training.py       reviewed-annotation export, safe splits, training/evaluation
+  gelgenie.py          verified pretrained ONNX segmentation-to-ROI adapter
+  sam_refiner.py       optional fixed-size ROI recentering with SAM 2.1
+scripts/
+  setup_ubuntu.sh      creates the Ubuntu environment (optional CPU/CUDA ML)
+  download_pretrained_models.py
+  prepare_public_training_data.py
+  smoke_pretrained_models.py
+  export_project_annotations.py
+  train_detector.py
 make_sample_blot.py    generates a synthetic 3x3 demo blot
-test_core.py           unit tests (run: python test_core.py)
+test_core.py           core unit tests
+test_ml_support.py     AI/export safety tests (Torch is imported only when needed)
 ```
 
 ## Tests
 
 ```bash
-python test_core.py
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q \
+  test_core.py test_ml_support.py test_sam_refiner.py
 ```
 
 Covers OCR label classification and unlabeled-lane inference, automatic dark/light
