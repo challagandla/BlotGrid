@@ -56,6 +56,10 @@ function imageHeight() {
   return args ? Math.max(1, Number(args.image_height)) : 1;
 }
 
+function resizeAllowed() {
+  return !args || args.allow_resize !== false;
+}
+
 function displayScale() {
   const rect = canvas.getBoundingClientRect();
   return rect.width ? rect.width / imageWidth() : 1;
@@ -117,6 +121,7 @@ function handlesFor(roi) {
 }
 
 function hitHandle(roi, point) {
+  if (!resizeAllowed()) return null;
   const radius = 8 / Math.max(point.scale, 0.05);
   const handles = handlesFor(roi);
   for (const name of HANDLE_NAMES) {
@@ -210,7 +215,7 @@ function draw() {
   }
 
   const index = selectedIndex();
-  if (index >= 0) {
+  if (index >= 0 && resizeAllowed()) {
     const handleRadius = clamp(4.5 / Math.max(scale, 0.05), 1.75, 14);
     ctx.save();
     for (const [x, y] of Object.values(handlesFor(rois[index]))) {
@@ -344,6 +349,10 @@ canvas.addEventListener("keydown", (event) => {
   const roi = rois[index];
   const step = event.shiftKey ? 10 : 1;
   if (event.altKey) {
+    if (!resizeAllowed()) {
+      event.preventDefault();
+      return;
+    }
     let width = roi.w;
     let height = roi.h;
     if (event.key === "ArrowLeft") width = Math.max(MIN_SIZE, width - step);

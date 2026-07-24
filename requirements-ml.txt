@@ -1,0 +1,5 @@
+# Tested matched pair. scripts/setup_ubuntu.sh selects the official CPU or
+# CUDA 11.8 PyTorch wheel index; do not upgrade only one package. PyTorch 2.7.1
+# includes the restricted-loader fix for CVE-2025-32434.
+torch==2.7.1
+torchvision==0.22.1

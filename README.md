@@ -8,19 +8,108 @@ A local Streamlit app to quantify Western blot bands from an image, optionally
 normalize each target against a housekeeping/loading control **in the same lane**,
 aggregate replicates, and export publication-quality bar charts.
 
-[Beginner tutorial](docs/BEGINNER_TUTORIAL.md) · [MIT license](LICENSE)
+[Beginner tutorial](docs/BEGINNER_TUTORIAL.md) ·
+[Pretrained model workflow](docs/PRETRAINED_MODELS.md) ·
+[Holdout evaluation schema](docs/HOLDOUT_EVALUATION.md) ·
+[Third-party models](THIRD_PARTY_MODELS.md) ·
+[Third-party data](THIRD_PARTY_DATA.md) ·
+[MIT license](LICENSE)
 
 ![BlotGrid workflow](docs/blotgrid-workflow.svg)
 
-## Install & run
+## Ubuntu install & run
 
 ```bash
-pip install -r requirements.txt          # once
-python make_sample_blot.py               # optional: makes sample_blot.tif to try
-streamlit run app.py
+sudo apt update
+sudo apt install -y python3 python3-venv
+./scripts/setup_ubuntu.sh
+./run_blotgrid.sh
 ```
 
-The app opens in your browser. No command line needed after launch.
+The launcher uses an isolated `.venv` and keeps caches inside the project. The
+app opens at `http://localhost:8501`; no command line is needed after launch.
+To create the optional demo image first, run `.venv/bin/python
+make_sample_blot.py`.
+
+The original code is Python/Streamlit and does not depend on Windows APIs.
+Ubuntu-specific setup, a local OCR-model fallback, and version-compatible ONNX
+Runtime dependencies are included here.
+
+### Optional pretrained detection
+
+BlotGrid can run the verified Apache-2.0 GelGenie Universal ONNX model and
+optionally use SAM 2.1 to recenter one selected ROI:
+
+```bash
+./scripts/setup_ubuntu.sh --with-ml
+.venv/bin/python scripts/download_pretrained_models.py \
+  --model gelgenie-universal
+
+# Optional SAM-assisted ROI refinement:
+./scripts/setup_ubuntu.sh --with-sam2 --ml-runtime cu118
+.venv/bin/python scripts/download_pretrained_models.py \
+  --model sam2.1-hiera-small
+```
+
+The installer chooses a tested CUDA 11.8 build when `nvidia-smi` is available
+and otherwise installs the CPU build. See the
+[pretrained model workflow](docs/PRETRAINED_MODELS.md) for GelGenie/SAM setup
+and application use.
+
+AI changes only the proposed ROI locations. BlotGrid still measures
+background-corrected intensity from the original native-depth pixels with its
+auditable classical densitometry.
+
+### Sealed detector comparison
+
+The optional evaluator compares the classical detector, verified GelGenie
+model, and one local format-2 detector checkpoint carrying publication metadata
+schema 2 on the same untouched holdout images. Its generated sidecar, embedded
+metadata, model state, and container are verified before use. The band cohort
+must be reviewed and approved by a person in BlotGrid, with
+human-approved artifact regions added to the holdout COCO record before it is
+sealed; the evaluator will not create or infer ground truth.
+
+Prepare randomized, method-blinded review tasks:
+
+```bash
+.venv/bin/python scripts/evaluate_detector.py prepare \
+  --annotations data/holdout/annotations.json \
+  --images data/holdout/images \
+  --seal data/holdout/seal.json \
+  --development-ledger data/development_ledger.json \
+  --plan data/holdout/evaluation_plan.json \
+  --checkpoint models/detector.pt \
+  --gelgenie-model models/gelgenie_universal.onnx \
+  --output runs/holdout-001
+```
+
+Give the reviewer `runs/holdout-001/reviewer_packet/` plus read-only access to
+the exact sealed `--images` directory through a separate channel. Do not give
+them the annotations, seal, or `evaluator_private/`. The packet contains the
+randomized task order and blinded project JSON files, but neither method
+identities nor ground truth. For each task, the reviewer restores its project
+in BlotGrid, re-uploads the sealed images (project JSON never embeds pixels),
+inspects the whole image, corrects and approves every active ROI, and saves the
+reviewed project under the task's original `<task-id>.json` filename in a
+separate directory. Evaluator ROI dimensions are frozen: reviewers may move,
+add, or disable fixed-size boxes, but the resize handles and size controls are
+locked. Then score the three reviewed projects:
+
+```bash
+.venv/bin/python scripts/evaluate_detector.py score \
+  --run runs/holdout-001 \
+  --reviewed-projects data/holdout/reviewed-projects \
+  --review-attestation data/holdout/review-attestation.json
+```
+
+The seal, complete development/model-selection ledger, checkpoint ancestry,
+review bindings, and every frozen input are hash-checked again at scoring.
+Outputs report clear/faint recall, border/text/smear/blank false positives,
+one-to-one IoU and centre errors, doublet recovery, equal-review edits,
+native-pixel intensity/fold-change errors, and scanner/exposure/target/
+background/acquisition-style strata. Runs stay under ignored `runs/` or
+`data/` directories and contain only JSON/CSV artifacts.
 
 ## Workflow (tabs, left to right)
 
@@ -59,7 +148,9 @@ The app opens in your browser. No command line needed after launch.
    resize all rectangles by one pixel. Numeric Width/Height controls and the
    X/Y table remain available for exact adjustments. An intensity-profile panel
    shows the vertical interval used for measurement. An evenly spaced manual grid
-   is available as a fallback.
+   is available as a fallback. Reviewed boxes can be explicitly approved as
+   training annotations; changing pixels, geometry, labels, or ROI inclusion
+   clears whole-image approval.
 3. **Quantify** — runs densitometry (integrated density with background subtraction);
    flags saturated bands and non-positive signals. Profile-guided integration is
    the default: it retains the locked lane width but integrates only the dominant
@@ -134,8 +225,9 @@ units rather than a misleading normalized value.
 
 The sidebar's **Save project (.json)** button writes labels, ROI layouts,
 replicate numbers and all measurement settings. **Load project** + **Restore
-project** brings them back; re-upload the images (matched back to their layout by
-file name) and re-run Quantify. Images are not embedded in the JSON.
+project** brings them back; re-upload the images and re-run Quantify. Images are
+not embedded in the JSON. Saved SHA-256 identities must match before a restored
+layout is applied; a same-named different image is rejected.
 
 ## Layout
 
@@ -150,14 +242,38 @@ wblot/
   stats.py             replicate aggregation, t-test / ANOVA
   plotting.py          publication bar chart builder
   project_io.py        save/load project JSON
+  ml_detector.py       optional TorchVision ROI proposals and checkpoint provenance
+  ml_training.py       reviewed-annotation export, safe splits, training/evaluation
+  holdout_evaluation.py sealed holdout validation, matching, and paired errors
+  gelgenie.py          verified pretrained ONNX segmentation-to-ROI adapter
+  sam_refiner.py       optional fixed-size ROI recentering with SAM 2.1
+scripts/
+  setup_ubuntu.sh      creates the Ubuntu environment (optional CPU/CUDA ML)
+  download_pretrained_models.py
+  prepare_public_training_data.py
+  smoke_pretrained_models.py
+  export_project_annotations.py
+  train_detector.py
+  check_checkpoint_release.py
+  evaluate_detector.py
 make_sample_blot.py    generates a synthetic 3x3 demo blot
-test_core.py           unit tests (run: python test_core.py)
+test_core.py           core unit tests
+test_ml_support.py     AI/export safety tests (Torch is imported only when needed)
+test_app_evaluator_policy.py evaluator-review UI lock tests
+test_checkpoint_release.py checkpoint/sidecar release-binding tests
+test_holdout_evaluation.py sealed comparison and native-pixel metric tests
+test_holdout_security.py evaluator privacy and aggregation security tests
 ```
 
 ## Tests
 
 ```bash
-python test_core.py
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q \
+  test_core.py test_ml_support.py test_sam_refiner.py \
+  test_public_training_data.py test_checkpoint_release.py \
+  test_holdout_evaluation.py test_holdout_security.py \
+  test_app_evaluator_policy.py
 ```
 
 Covers OCR label classification and unlabeled-lane inference, automatic dark/light

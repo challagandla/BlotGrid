@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """BlotGrid — local Western blot alignment and quantification app.
 
 Quantify band intensities from a blot image, normalize each target against a
@@ -8,15 +9,20 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import io
 import os
 from pathlib import Path
 
-# Matplotlib otherwise tries to write its font cache beside the user's profile,
-# which can be read-only in managed lab/workstation environments.
+# Keep Matplotlib's cache in the standard Linux user-cache location. Launchers or
+# managed systems can override either MPLCONFIGDIR or XDG_CACHE_HOME.
+_cache_root = Path(
+    os.environ.get("XDG_CACHE_HOME", Path(__file__).resolve().parent / ".cache")
+)
 os.environ.setdefault(
     "MPLCONFIGDIR",
-    str(Path(__file__).resolve().parent / ".cache" / "matplotlib"),
+    str(_cache_root / "blotgrid" / "matplotlib"),
 )
 
 import numpy as np
@@ -29,7 +35,8 @@ import streamlit as st
 
 from wblot import (alignment, detection, image_io, densitometry, normalization, stats,
                    plotting, project_io, roi_constraints, roi_editor,
-                   label_ocr)
+                   gelgenie, holdout_evaluation, label_ocr, ml_detector,
+                   sam_refiner)
 
 st.set_page_config(page_title="BlotGrid", page_icon="▦", layout="wide")
 
@@ -40,8 +47,13 @@ S = st.session_state
 S.setdefault("blots", {})        # name -> LoadedImage
 S.setdefault("original_blots", {})  # untouched uploads used for non-cumulative rotation
 S.setdefault("alignment_applied", {})  # name -> correction angle in degrees
+S.setdefault("image_provenance", {})  # name -> original upload SHA/dimensions
 S.setdefault("layouts", {})      # name -> layout dict
 S.setdefault("replicate", {})    # name -> replicate int
+S.setdefault("study_group", {})  # name -> leakage-safe study/experiment group
+S.setdefault("annotation_complete", {})  # name -> whole-image human review
+S.setdefault("evaluation_task", {})  # opaque blinded holdout task binding
+S.setdefault("upload_generation", 0)  # rotate uploader keys after restore/clear
 S.setdefault("targets", [])
 S.setdefault("control", "")
 S.setdefault("lanes", [])
@@ -52,6 +64,18 @@ S.setdefault("metadata_message", "Upload a labelled blot or raw scan to fill thi
 S.setdefault("bands_dark", True)
 S.setdefault("polarity_mode", "auto")
 S.setdefault("detection_sensitivity", 0.65)
+S.setdefault("detection_backend", "classical")
+S.setdefault("ml_checkpoint", "models/blotgrid_detector.pt")
+S.setdefault("ml_device", "auto")
+S.setdefault("ml_score_threshold", 0.50)
+S.setdefault("ml_review_threshold", 0.75)
+S.setdefault("gelgenie_model", gelgenie.DEFAULT_MODEL_PATH)
+S.setdefault("gelgenie_probability_threshold", 0.50)
+S.setdefault("gelgenie_review_threshold", 0.75)
+S.setdefault("gelgenie_normalization", "auto")
+S.setdefault("sam_checkpoint", sam_refiner.DEFAULT_CHECKPOINT_PATH)
+S.setdefault("sam_device", "auto")
+S.setdefault("sam_context_scale", 4.0)
 S.setdefault("bg_method", "local")
 S.setdefault("bg_margin", 6)
 S.setdefault("rb_radius", 50)
@@ -80,16 +104,102 @@ S.setdefault("fig_h", 4.0)
 NO_CONTROL_OPTION = "No control — intensity only"
 
 # Settings written to / restored from a project file. Images are not embedded;
-# they are re-uploaded and matched back to their layout by file name.
-PROJECT_KEYS = ["targets", "control", "lanes", "bands_dark", "polarity_mode",
-                "detection_sensitivity", "bg_method",
-                "bg_margin", "rb_radius", "bg_fixed", "multiband",
-                "measurement_mode", "layouts", "replicate"]
+# they are re-uploaded and verified against image_provenance before reuse.
+PROJECT_DEFAULTS = {
+    "targets": [],
+    "control": "",
+    "lanes": [],
+    "bands_dark": True,
+    "polarity_mode": "auto",
+    "detection_sensitivity": 0.65,
+    "detection_backend": "classical",
+    "ml_checkpoint": "models/blotgrid_detector.pt",
+    "ml_device": "auto",
+    "ml_score_threshold": 0.50,
+    "ml_review_threshold": 0.75,
+    "gelgenie_model": gelgenie.DEFAULT_MODEL_PATH,
+    "gelgenie_probability_threshold": 0.50,
+    "gelgenie_review_threshold": 0.75,
+    "gelgenie_normalization": "auto",
+    "sam_checkpoint": sam_refiner.DEFAULT_CHECKPOINT_PATH,
+    "sam_device": "auto",
+    "sam_context_scale": 4.0,
+    "bg_method": "local",
+    "bg_margin": 6,
+    "rb_radius": 50,
+    "bg_fixed": 0.0,
+    "multiband": "sum",
+    "measurement_mode": "profile",
+    "layouts": {},
+    "replicate": {},
+    "study_group": {},
+    "annotation_complete": {},
+    "alignment_applied": {},
+    "image_provenance": {},
+    # Opaque evaluator binding for imported blinded holdout tasks. The app does
+    # not interpret it; save/restore preserves it for fail-closed scoring.
+    "evaluation_task": {},
+}
+PROJECT_KEYS = list(PROJECT_DEFAULTS)
+evaluation_task_locked = bool(S.get("evaluation_task"))
 
 
 def clamp(v, lo, hi) -> int:
     """Keep a stored slider value inside the range this image allows."""
     return int(min(max(int(v), lo), hi))
+
+
+def _literal_checkbox(value, default: bool = False) -> bool:
+    """Accept only real JSON/Python booleans from approval-sensitive fields."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return bool(default)
+
+
+def _validated_alignment_angle(value) -> tuple[float, bool]:
+    """Return a finite, UI-supported alignment angle or a safe reset."""
+    try:
+        angle = float(value)
+    except (TypeError, ValueError):
+        return 0.0, False
+    if not np.isfinite(angle) or not -15.0 <= angle <= 15.0:
+        return 0.0, False
+    return angle, True
+
+
+def _sanitize_restored_annotations() -> None:
+    """Fail closed when approval booleans in a project are malformed."""
+    layouts = S.get("layouts")
+    if not isinstance(layouts, dict):
+        S["layouts"] = {}
+        layouts = S["layouts"]
+    complete = S.get("annotation_complete")
+    if not isinstance(complete, dict):
+        complete = {}
+        S["annotation_complete"] = complete
+    for image_name, layout in layouts.items():
+        if not isinstance(layout, dict):
+            continue
+        layout["annotation_complete"] = (
+            layout.get("annotation_complete") is True
+            and complete.get(image_name) is True
+        )
+        layout["negative_image"] = (
+            layout["annotation_complete"]
+            and layout.get("negative_image") is True
+        )
+        complete[image_name] = layout["annotation_complete"]
+        rois = layout.get("rois")
+        if not isinstance(rois, list):
+            continue
+        for roi in rois:
+            if not isinstance(roi, dict):
+                continue
+            roi["use"] = _literal_checkbox(roi.get("use", True))
+            roi["annotation_approved"] = (
+                roi.get("annotation_approved") is True
+                and roi["use"]
+            )
 
 
 def _invalidate_results() -> None:
@@ -140,12 +250,25 @@ def _ensure_roi_ids(layout) -> None:
     layout["next_roi_id"] = counter
 
 
-def _apply_roi_editor_event(layout, event, lanes, img: image_io.LoadedImage) -> bool:
+def _apply_roi_editor_event(
+    layout,
+    event,
+    lanes,
+    img: image_io.LoadedImage,
+    *,
+    allow_resize: bool = True,
+) -> bool:
     """Apply a canvas edit while enforcing the per-lane size lock in Python."""
     _ensure_roi_ids(layout)
     shared_size = _ensure_shared_roi_size(layout, img)
     changed = roi_constraints.apply_editor_event(
-        layout.get("rois", []), shared_size, event, img.width, img.height)
+        layout.get("rois", []),
+        shared_size,
+        event,
+        img.width,
+        img.height,
+        allow_resize=allow_resize,
+    )
     layout["roi_size"] = shared_size
     _ensure_shared_roi_size(layout, img)
     return changed
@@ -203,6 +326,7 @@ def _add_manual_band_boxes(
         layout.setdefault("rois", []).append({
             "roi_id": roi_id,
             "use": True,
+            "annotation_approved": False,
             "target": target,
             "lane": lane,
             "x": x,
@@ -226,9 +350,30 @@ def _clear_roi_widget_state(image_name: str) -> None:
     prefixes = (f"roi_table_{image_name}", f"roi_canvas_{image_name}",
                 f"roi_canvas_event_{image_name}", f"lane_roi_w_{image_name}_",
                 f"lane_roi_h_{image_name}_", f"roi_width_{image_name}",
-                f"roi_height_{image_name}")
+                f"roi_height_{image_name}", f"approve_attestation_{image_name}",
+                f"approve_all_rois_{image_name}", f"clear_all_rois_{image_name}",
+                f"profile_roi_{image_name}", f"manual_target_{image_name}",
+                f"manual_lane_{image_name}", f"manual_count_{image_name}",
+                f"add_manual_roi_{image_name}", f"roi_fit_{image_name}",
+                f"roi_zoom_{image_name}", f"roi_ph_{image_name}",
+                f"roi_sbs_{image_name}", f"roi_share_{image_name}",
+                 f"roi_th_{image_name}", f"rep_{image_name}",
+                 f"study_group_{image_name}", f"auto_align_{image_name}",
+                 f"apply_align_{image_name}", f"reset_align_{image_name}",
+                 f"align_angle_{image_name}", f"_pending_align_angle_{image_name}",
+                 f"align_grid_{image_name}", f"sam_refine_{image_name}")
     for key in [key for key in S.keys() if key.startswith(prefixes)]:
         del S[key]
+
+
+def _invalidate_annotation_review(image_name: str) -> None:
+    """Require a fresh whole-image review after any ROI or pixel change."""
+    S.setdefault("annotation_complete", {})[image_name] = False
+    layout = S.get("layouts", {}).get(image_name)
+    if isinstance(layout, dict):
+        layout["annotation_complete"] = False
+        layout["negative_image"] = False
+    S.pop(f"approve_attestation_{image_name}", None)
 
 
 def _reset_image_analysis(image_name: str) -> None:
@@ -236,7 +381,12 @@ def _reset_image_analysis(image_name: str) -> None:
     S["label_scans"].pop(image_name, None)
     S["layouts"].pop(image_name, None)
     _clear_roi_widget_state(image_name)
+    _invalidate_annotation_review(image_name)
     _invalidate_results()
+
+
+for _image_name in S.pop("_pending_image_widget_clear", []):
+    _clear_roi_widget_state(str(_image_name))
 
 
 def _alignment_figure(img: image_io.LoadedImage, grid_step: int):
@@ -261,6 +411,8 @@ def default_layout(img: image_io.LoadedImage, targets, n_lanes):
     lane_x = list(np.linspace(W * 0.18, W * 0.82, n_lanes).astype(int))
     ys = np.linspace(H * 0.2, H * 0.8, len(targets))
     return {
+        "annotation_complete": False,
+        "negative_image": False,
         "lane_x": lane_x,
         "band_width": max(12, int(W * 0.12)),
         "targets": {t: {"y": int(y), "h": max(10, int(H * 0.08))} for t, y in zip(targets, ys)},
@@ -280,24 +432,80 @@ def automatic_layout(img: image_io.LoadedImage, targets, lanes):
             lane_hint = stored_lane_centers
         if len(stored_target_centers) == len(targets):
             target_hint = stored_target_centers
-    result = detection.detect_bands(
-        img.gray,
-        targets,
-        lanes,
-        polarity=mode,
-        sensitivity=S.get("detection_sensitivity", 0.65),
-        lane_centers_hint=lane_hint,
-        target_centers_hint=target_hint,
-    )
+    backend = S.get("detection_backend", "classical")
+    detector_provenance = {"backend": "classical"}
+    if backend == "ai_hybrid":
+        checkpoint = S.get("ml_checkpoint", "")
+        result = ml_detector.predict_bands(
+            img.gray,
+            targets,
+            lanes,
+            checkpoint,
+            polarity=mode,
+            score_threshold=S.get("ml_score_threshold", 0.50),
+            review_threshold=S.get("ml_review_threshold", 0.75),
+            device=S.get("ml_device", "auto"),
+            lane_centers_hint=lane_hint,
+            target_centers_hint=target_hint,
+        )
+        detector_provenance = {
+            **ml_detector.checkpoint_provenance(checkpoint),
+            "backend": "ai_hybrid",
+            "score_threshold": S.get("ml_score_threshold", 0.50),
+            "review_threshold": S.get("ml_review_threshold", 0.75),
+        }
+    elif backend == "gelgenie_hybrid":
+        model_path = S.get("gelgenie_model", gelgenie.DEFAULT_MODEL_PATH)
+        result = gelgenie.predict_bands(
+            img.gray,
+            targets,
+            lanes,
+            model_path,
+            max_value=img.max_value,
+            probability_threshold=S.get(
+                "gelgenie_probability_threshold", 0.50
+            ),
+            review_threshold=S.get("gelgenie_review_threshold", 0.75),
+            device=S.get("ml_device", "auto"),
+            normalization=S.get("gelgenie_normalization", "auto"),
+            lane_centers_hint=lane_hint,
+            target_centers_hint=target_hint,
+            polarity=mode,
+        )
+        detector_provenance = {
+            **gelgenie.model_provenance(model_path),
+            "backend": "gelgenie_hybrid",
+            "probability_threshold": S.get(
+                "gelgenie_probability_threshold", 0.50
+            ),
+            "review_threshold": S.get("gelgenie_review_threshold", 0.75),
+            "requested_device": S.get("ml_device", "auto"),
+            "execution_provider": gelgenie.runtime_provider(
+                S.get("ml_device", "auto")
+            ),
+            "available_providers": gelgenie.available_providers(),
+            "normalization": S.get("gelgenie_normalization", "auto"),
+            "input_inverted": bool(result.bands_are_dark),
+        }
+    else:
+        result = detection.detect_bands(
+            img.gray,
+            targets,
+            lanes,
+            polarity=mode,
+            sensitivity=S.get("detection_sensitivity", 0.65),
+            lane_centers_hint=lane_hint,
+            target_centers_hint=target_hint,
+        )
     directly_detected = len(result.bands)
     fallback_count = detection.ensure_complete_grid(
         result, targets, lanes, img.gray.shape,
         gray=img.gray,
         sensitivity=S.get("detection_sensitivity", 0.65),
     )
-    heights = [b.h for b in result.bands]
     widths = [b.w for b in result.bands]
-    roi_rows = [dict(b.as_row(), roi_id=f"roi_{index}")
+    roi_rows = [dict(b.as_row(), roi_id=f"roi_{index}",
+                     annotation_approved=False)
                 for index, b in enumerate(result.bands)]
     roi_size = ({"w": roi_rows[0]["w"], "h": roi_rows[0]["h"]}
                 if roi_rows else {"w": max(6, int(img.width * 0.12)),
@@ -311,6 +519,10 @@ def automatic_layout(img: image_io.LoadedImage, targets, lanes):
         }
     return {
         "mode": "automatic",
+        "annotation_complete": False,
+        "negative_image": False,
+        "detection_backend": backend,
+        "detector_provenance": detector_provenance,
         "rois": roi_rows,
         "roi_size": roi_size,
         # Keep the coarse-grid fields for backward-compatible project files and
@@ -385,6 +597,9 @@ def _queue_detected_metadata(labels: label_ocr.ExperimentLabels, image_name: str
     S["metadata_autofill_done"] = True
     # Target/lane names are part of every ROI identity. Rebuild layouts rather
     # than retaining rectangles labelled with the previous placeholders.
+    for blot_name in list(S.get("blots", {})):
+        _clear_roi_widget_state(str(blot_name))
+        _invalidate_annotation_review(str(blot_name))
     S["layouts"] = {}
     _invalidate_results()
 
@@ -418,7 +633,8 @@ with st.sidebar:
     st.header("Experiment setup")
     target_text = st.text_area(
         "Targets (one per line, top→bottom)", height=150, key="targets_input",
-        placeholder="Automatically read after image upload")
+        placeholder="Automatically read after image upload",
+        disabled=evaluation_task_locked)
     S["targets"] = [line.strip() for line in target_text.splitlines() if line.strip()]
     if S["targets"]:
         desired_control = (S["control"] if S["control"] in S["targets"]
@@ -429,15 +645,221 @@ with st.sidebar:
         selected_control = st.selectbox(
             "Loading control (optional)", control_options, key="control_select",
             help="Choose no control when the scan has no recognized housekeeping band. "
-                 "The app will report background-corrected intensity without normalization.")
+                 "The app will report background-corrected intensity without normalization.",
+            disabled=evaluation_task_locked)
         S["control"] = "" if selected_control == NO_CONTROL_OPTION else selected_control
     else:
         S["control"] = ""
     lane_text = st.text_area(
         "Lanes / conditions (one per line, left→right)", height=90,
-        key="lanes_input", placeholder="Read from labels, or inferred as Lane 1, Lane 2, …")
+        key="lanes_input", placeholder="Read from labels, or inferred as Lane 1, Lane 2, …",
+        disabled=evaluation_task_locked)
     S["lanes"] = [line.strip() for line in lane_text.splitlines() if line.strip()]
     st.caption(S.get("metadata_message", ""))
+
+    st.divider()
+    st.subheader("Band detection")
+    if evaluation_task_locked:
+        st.info(
+            "Blinded evaluator task: detector, backend, labels, and pixel "
+            "alignment are locked. Review and edit the supplied ROIs manually."
+        )
+    detection_backends = {
+        "Classical detector (no model required)": "classical",
+        "GelGenie pretrained ONNX + classical recovery": "gelgenie_hybrid",
+        "AI checkpoint + classical missing-band recovery": "ai_hybrid",
+    }
+    current_backend = S.get("detection_backend", "classical")
+    backend_label = st.selectbox(
+        "Detection backend",
+        list(detection_backends),
+        index=next(
+            (index for index, (_, value) in enumerate(detection_backends.items())
+             if value == current_backend),
+            0,
+        ),
+        help="Both modes only propose editable ROIs. Quantification always uses "
+             "the original native-range pixels and classical background subtraction.",
+        disabled=evaluation_task_locked,
+    )
+    S["detection_backend"] = detection_backends[backend_label]
+    if S["detection_backend"] == "ai_hybrid":
+        S["ml_checkpoint"] = st.text_input(
+            "AI checkpoint path",
+            value=str(S.get("ml_checkpoint", "models/blotgrid_detector.pt")),
+            help="Local .pt checkpoint produced by scripts/train_detector.py.",
+            disabled=evaluation_task_locked,
+        )
+        threshold_columns = st.columns(2)
+        stored_score = min(
+            0.95, max(0.05, float(S.get("ml_score_threshold", 0.50))))
+        S["ml_score_threshold"] = threshold_columns[0].slider(
+            "Minimum AI score",
+            0.05, 0.95, stored_score, 0.05,
+            disabled=evaluation_task_locked,
+        )
+        stored_review = min(
+            1.0,
+            max(float(S["ml_score_threshold"]),
+                float(S.get("ml_review_threshold", 0.75))),
+        )
+        S["ml_review_threshold"] = threshold_columns[1].slider(
+            "Review below",
+            float(S["ml_score_threshold"]), 1.0,
+            stored_review,
+            0.05,
+            disabled=evaluation_task_locked,
+        )
+        S["ml_device"] = st.selectbox(
+            "AI device",
+            ["auto", "cpu", "cuda"],
+            index=["auto", "cpu", "cuda"].index(
+                S.get("ml_device", "auto")
+                if S.get("ml_device", "auto") in {"auto", "cpu", "cuda"}
+                else "auto"
+            ),
+            help="Auto uses CUDA when PyTorch can access it, otherwise CPU.",
+            disabled=evaluation_task_locked,
+        )
+        st.caption(
+            "AI boxes are never measurements or ground truth. Review every ROI; "
+            "missing grid cells still use the conservative classical recovery pass."
+        )
+    elif S["detection_backend"] == "gelgenie_hybrid":
+        S["gelgenie_model"] = st.text_input(
+            "GelGenie ONNX model path",
+            value=str(
+                S.get("gelgenie_model", gelgenie.DEFAULT_MODEL_PATH)
+            ),
+            help=(
+                "Pinned Apache-2.0 GelGenie Universal model. Install it with "
+                "scripts/download_pretrained_models.py."
+            ),
+            disabled=evaluation_task_locked,
+        )
+        normalization_options = {
+            "Automatic (8-bit range; 16-bit percentile)": "auto",
+            "Datatype maximum": "dtype_max",
+            "0.1–99.9 percentile": "percentile",
+        }
+        stored_normalization = S.get("gelgenie_normalization", "auto")
+        S["gelgenie_normalization"] = normalization_options[
+            st.selectbox(
+                "GelGenie normalization",
+                list(normalization_options),
+                index=next(
+                    (
+                        index
+                        for index, value in enumerate(
+                            normalization_options.values()
+                        )
+                        if value == stored_normalization
+                    ),
+                    0,
+                ),
+                help=(
+                    "Automatic follows the current GelGenie recommendation for "
+                    "16-bit images while retaining exact 8-bit scaling."
+                ),
+                disabled=evaluation_task_locked,
+            )
+        ]
+        threshold_columns = st.columns(2)
+        stored_probability = min(
+            0.95,
+            max(
+                0.05,
+                float(S.get("gelgenie_probability_threshold", 0.50)),
+            ),
+        )
+        S["gelgenie_probability_threshold"] = threshold_columns[0].slider(
+            "Band probability",
+            0.05,
+            0.95,
+            stored_probability,
+            0.05,
+            disabled=evaluation_task_locked,
+        )
+        stored_review = min(
+            1.0,
+            max(
+                float(S["gelgenie_probability_threshold"]),
+                float(S.get("gelgenie_review_threshold", 0.75)),
+            ),
+        )
+        S["gelgenie_review_threshold"] = threshold_columns[1].slider(
+            "Review below",
+            float(S["gelgenie_probability_threshold"]),
+            1.0,
+            stored_review,
+            0.05,
+            disabled=evaluation_task_locked,
+        )
+        S["ml_device"] = st.selectbox(
+            "GelGenie device",
+            ["auto", "cpu", "cuda"],
+            index=["auto", "cpu", "cuda"].index(
+                S.get("ml_device", "auto")
+                if S.get("ml_device", "auto") in {"auto", "cpu", "cuda"}
+                else "auto"
+            ),
+            help=(
+                "The default ONNX Runtime package uses CPU. CUDA requires a "
+                "compatible onnxruntime-gpu installation."
+            ),
+            disabled=evaluation_task_locked,
+        )
+        st.caption(
+            "GelGenie is pretrained on electrophoresis gels rather than Western "
+            "blots. Its mask is converted into editable shared-size ROIs; "
+            "BlotGrid still quantifies the untouched native-depth image."
+        )
+
+    with st.expander("Experimental SAM ROI refinement", expanded=False):
+        sam_status = sam_refiner.runtime_status()
+        S["sam_checkpoint"] = st.text_input(
+            "SAM 2.1 checkpoint path",
+            value=str(
+                S.get(
+                    "sam_checkpoint",
+                    sam_refiner.DEFAULT_CHECKPOINT_PATH,
+                )
+            ),
+            help=(
+                "Verified SAM 2.1 Hiera Small checkpoint. Download it with "
+                "scripts/download_pretrained_models.py --model "
+                "sam2.1-hiera-small."
+            ),
+            disabled=evaluation_task_locked,
+        )
+        S["sam_device"] = st.selectbox(
+            "SAM device",
+            ["auto", "cpu", "cuda"],
+            index=["auto", "cpu", "cuda"].index(
+                S.get("sam_device", "auto")
+                if S.get("sam_device", "auto") in {"auto", "cpu", "cuda"}
+                else "auto"
+            ),
+            disabled=evaluation_task_locked,
+        )
+        S["sam_context_scale"] = st.slider(
+            "SAM context around ROI",
+            2.0,
+            8.0,
+            float(S.get("sam_context_scale", 4.0)),
+            0.5,
+            disabled=evaluation_task_locked,
+        )
+        if sam_status["package_available"]:
+            st.caption(
+                "SAM 2.1 package available. Refinement recenters a selected "
+                "ROI but cannot change the shared measurement width or height."
+            )
+        else:
+            st.caption(
+                "Optional package not installed. Run "
+                "scripts/setup_ubuntu.sh --with-sam2 before using refinement."
+            )
 
     st.divider()
     st.subheader("Signal & background")
@@ -453,14 +875,16 @@ with st.sidebar:
          if polarity_labels[label] == current_polarity), 0)
     polarity_label = st.selectbox(
         "Band polarity", polarity_names, index=polarity_index,
-        help="Automatic polarity is detected separately for every uploaded blot.")
+        help="Automatic polarity is detected separately for every uploaded blot.",
+        disabled=evaluation_task_locked)
     S["polarity_mode"] = polarity_labels[polarity_label]
     if S["polarity_mode"] != "auto":
         S["bands_dark"] = S["polarity_mode"] == "dark"
     S["detection_sensitivity"] = st.slider(
-        "Automatic detection sensitivity", 0.0, 1.0,
+        "Classical / recovery sensitivity", 0.0, 1.0,
         float(S.get("detection_sensitivity", 0.65)), 0.05,
-        help="Raise this to retain very faint bands; lower it if dust or noise is being selected.")
+        help="Raise this to retain very faint bands; lower it if dust or noise is being selected.",
+        disabled=evaluation_task_locked)
     S["bg_method"] = st.selectbox("Background subtraction",
                                   ["local", "rolling_ball", "fixed"],
                                   index=["local", "rolling_ball", "fixed"].index(S["bg_method"]))
@@ -500,6 +924,39 @@ with st.sidebar:
         S["measurement_mode"] = selected_measurement_mode
         _invalidate_results()
 
+    roi_identity_signature = (
+        tuple(S["targets"]),
+        tuple(S["lanes"]),
+    )
+    previous_roi_identity = S.get("_roi_identity_signature")
+    if (previous_roi_identity is not None
+            and previous_roi_identity != roi_identity_signature):
+        for blot_name in list(S.get("blots", {})):
+            _clear_roi_widget_state(str(blot_name))
+            _invalidate_annotation_review(str(blot_name))
+        S["layouts"] = {}
+        _invalidate_results()
+    S["_roi_identity_signature"] = roi_identity_signature
+
+    quantification_signature = (
+        tuple(S["targets"]),
+        tuple(S["lanes"]),
+        S["control"],
+        S["polarity_mode"],
+        bool(S["bands_dark"]),
+        S["bg_method"],
+        int(S["bg_margin"]),
+        int(S["rb_radius"]),
+        float(S["bg_fixed"]),
+        S["multiband"],
+        S["measurement_mode"],
+    )
+    previous_quantification = S.get("_quantification_signature")
+    if (previous_quantification is not None
+            and previous_quantification != quantification_signature):
+        _invalidate_results()
+    S["_quantification_signature"] = quantification_signature
+
     st.divider()
     st.subheader("Project")
     st.download_button(
@@ -509,9 +966,47 @@ with st.sidebar:
     proj = st.file_uploader("Load project (.json)", type=["json"], key="proj_up")
     if proj is not None and st.button("Restore project"):
         data = project_io.load_project(proj.getvalue())
-        for k in PROJECT_KEYS:
-            if data.get(k) is not None:
-                S[k] = data[k]
+        restored_task = data.get("evaluation_task", {})
+        if restored_task:
+            restored_layouts = data.get("layouts")
+            if not isinstance(restored_task, dict) or not isinstance(
+                restored_layouts, dict
+            ) or not restored_layouts:
+                st.error(
+                    "The blinded evaluator project is malformed or lacks its "
+                    "sealed proposal layouts."
+                )
+                st.stop()
+            try:
+                holdout_evaluation.validate_sealed_alignment(
+                    data.get("alignment_applied", {}),
+                    restored_layouts,
+                )
+            except holdout_evaluation.EvaluationError as exc:
+                st.error(str(exc))
+                st.stop()
+        prior_image_names = set(S.get("layouts", {})) | set(S.get("blots", {}))
+        for key, default in PROJECT_DEFAULTS.items():
+            value = data.get(key, default)
+            S[key] = copy.deepcopy(default if value is None else value)
+        for key in ("layouts", "replicate", "study_group",
+                    "annotation_complete", "alignment_applied",
+                    "image_provenance"):
+            if not isinstance(S.get(key), dict):
+                S[key] = {}
+        _sanitize_restored_annotations()
+        S.pop("_roi_identity_signature", None)
+        S.pop("_quantification_signature", None)
+        # A project stores image identity and ROI coordinates, not image bytes.
+        # Force a re-upload so the SHA check below can reject a same-named but
+        # different blot before applying saved geometry.
+        S["blots"] = {}
+        S["original_blots"] = {}
+        S["label_scans"] = {}
+        S["upload_generation"] = int(S.get("upload_generation", 0)) + 1
+        for image_name in prior_image_names | set(S.get("layouts", {})):
+            _clear_roi_widget_state(str(image_name))
+        _invalidate_results()
         restored_targets = list(S.get("targets", []))
         restored_lanes = list(S.get("lanes", []))
         S["_pending_metadata"] = {
@@ -525,7 +1020,8 @@ with st.sidebar:
         # ROI sliders are keyed widgets: their stored state would otherwise win
         # over the restored layout, so clear them and let the sliders rebuild.
         for wk in [k for k in S.keys()
-                   if k.startswith(("lx_", "ty_", "th_", "bw_", "rep_"))]:
+                   if k.startswith(("lx_", "ty_", "th_", "bw_", "rep_",
+                                    "study_group_"))]:
             del S[wk]
         st.success("Project restored. Re-upload the blot images to re-quantify.")
         st.rerun()
@@ -546,24 +1042,127 @@ with tabs[0]:
     )
     ups = st.file_uploader("Blot images (TIFF / PNG / JPG)",
                            type=["tif", "tiff", "png", "jpg", "jpeg"],
-                           accept_multiple_files=True)
+                           accept_multiple_files=True,
+                           key=f"blot_upload_{int(S['upload_generation'])}")
     if ups:
         metadata_rerun = False
+        seen_upload_names: dict[str, str] = {}
         for i, up in enumerate(ups):
             name = up.name
-            if name not in S["blots"]:
-                uploaded_image = image_io.load_image(up.getvalue(), name=name)
-                S["original_blots"][name] = uploaded_image
-                S["blots"][name] = uploaded_image
+            upload_bytes = up.getvalue()
+            upload_sha = hashlib.sha256(upload_bytes).hexdigest()
+            prior_seen_sha = seen_upload_names.get(name)
+            if prior_seen_sha is not None:
+                if prior_seen_sha != upload_sha:
+                    st.error(
+                        f"Two different uploaded files are both named {name}. "
+                        "Rename one file so image identity and ROI provenance stay unambiguous."
+                    )
+                continue
+            seen_upload_names[name] = upload_sha
+            expected_provenance = S["image_provenance"].get(name, {})
+            if not isinstance(expected_provenance, dict):
+                expected_provenance = {}
+            current_sha = expected_provenance.get("sha256")
+            restored_layout_without_hash = (
+                name not in S["blots"]
+                and name in S.get("layouts", {})
+                and not current_sha
+            )
+            if restored_layout_without_hash:
+                S["layouts"].pop(name, None)
                 S["alignment_applied"][name] = 0.0
+                S["replicate"].pop(name, None)
+                S["study_group"].pop(name, None)
+                _clear_roi_widget_state(name)
+                _invalidate_annotation_review(name)
+                _invalidate_results()
+                st.warning(
+                    f"{name} came from a legacy project without a saved image "
+                    "SHA-256. Its saved ROIs, alignment, replicate/study assignment, "
+                    "and approvals were discarded; detect and review this image again."
+                )
+            if name not in S["blots"] and current_sha and current_sha != upload_sha:
+                st.error(
+                    f"{name} was not loaded: its SHA-256 does not match the image "
+                    "stored in this project. Upload the exact original, or rename "
+                    "this different image and add it as a new blot."
+                )
+                continue
+            replacing_image = name in S["blots"] and current_sha != upload_sha
+            if replacing_image:
+                S["blots"].pop(name, None)
+                S["original_blots"].pop(name, None)
+                S["label_scans"].pop(name, None)
+                S["layouts"].pop(name, None)
+                S["replicate"].pop(name, None)
+                S["study_group"].pop(name, None)
+                S["annotation_complete"].pop(name, None)
+                S["alignment_applied"][name] = 0.0
+                _clear_roi_widget_state(name)
+                _invalidate_annotation_review(name)
+                _invalidate_results()
+                st.warning(
+                    f"{name} was replaced by different image bytes. Its old ROIs, "
+                    "alignment, replicate/study assignment, and derived results "
+                    "were discarded."
+                )
+            if name not in S["blots"]:
+                uploaded_image = image_io.load_image(upload_bytes, name=name)
+                previous_provenance = S["image_provenance"].get(name, {})
+                sha_mismatch = (
+                    previous_provenance.get("sha256")
+                    and previous_provenance["sha256"] != upload_sha
+                )
+                restored_angle, angle_valid = _validated_alignment_angle(
+                    S["alignment_applied"].get(name, 0.0)
+                )
+                if evaluation_task_locked and (
+                    not angle_valid or abs(restored_angle) > 1e-12
+                ):
+                    st.error(
+                        f"{name} was not loaded: blinded evaluator tasks must "
+                        "remain on the original sealed pixels with 0.0° alignment."
+                    )
+                    continue
+                if not angle_valid:
+                    S["layouts"].pop(name, None)
+                    _clear_roi_widget_state(name)
+                    _invalidate_annotation_review(name)
+                    st.warning(
+                        f"{name} had an invalid saved alignment angle; it was "
+                        "reset to 0.0° and its coordinate-dependent ROIs and "
+                        "approvals were discarded."
+                    )
+                if sha_mismatch:
+                    S["layouts"].pop(name, None)
+                    restored_angle = 0.0
+                    st.warning(
+                        f"{name} does not match the image saved with this project. "
+                        "Its saved ROIs and alignment were discarded."
+                    )
+                S["original_blots"][name] = uploaded_image
+                S["blots"][name] = (
+                    alignment.rotate_loaded(uploaded_image, restored_angle)
+                    if abs(restored_angle) > 1e-12 else uploaded_image
+                )
+                S["alignment_applied"][name] = restored_angle
+                S["image_provenance"][name] = {
+                    "sha256": upload_sha,
+                    "width": uploaded_image.width,
+                    "height": uploaded_image.height,
+                    "bit_depth": uploaded_image.bit_depth,
+                }
                 _invalidate_results()
                 S["replicate"].setdefault(name, len(S["replicate"]) + 1)
+                S["study_group"].setdefault(name, "")
+                S["annotation_complete"].setdefault(name, False)
             elif name not in S["original_blots"]:
                 # Supports sessions created before scan alignment was added.
                 S["original_blots"][name] = S["blots"][name]
                 S["alignment_applied"].setdefault(name, 0.0)
 
-            if name not in S["label_scans"]:
+            if name not in S["label_scans"] and not evaluation_task_locked:
                 try:
                     with st.spinner(f"Reading labels or inferring the raw scan grid for {name}..."):
                         S["label_scans"][name] = label_ocr.read_experiment_labels_or_grid(
@@ -575,7 +1174,8 @@ with tabs[0]:
             # Streamlit preserves session objects across a source hot reload.
             # Refresh an older OCR result locally when it lacks the newer
             # spatial fields, rather than asking for another upload.
-            if (isinstance(scan, label_ocr.ExperimentLabels)
+            if (not evaluation_task_locked
+                    and isinstance(scan, label_ocr.ExperimentLabels)
                     and (not hasattr(scan, "lane_centers")
                          or not hasattr(scan, "target_centers"))):
                 try:
@@ -595,7 +1195,8 @@ with tabs[0]:
                 and current_lanes_are_generic
                 and len(scan.lanes) > len(S.get("lanes", []))
             )
-            if ((not S.get("metadata_autofill_done") or inferred_lane_upgrade)
+            if (not evaluation_task_locked
+                    and (not S.get("metadata_autofill_done") or inferred_lane_upgrade)
                     and isinstance(scan, label_ocr.ExperimentLabels)
                     and scan.targets and scan.lanes):
                 _queue_detected_metadata(scan, name)
@@ -605,6 +1206,12 @@ with tabs[0]:
             # A restored project's layout survives image re-upload. New images
             # and layouts reset by OCR are detected with the current metadata.
             if name not in S["layouts"]:
+                if evaluation_task_locked:
+                    st.error(
+                        f"{name} has no sealed proposal layout. Re-import the "
+                        "original blinded evaluator task; detector fallback is disabled."
+                    )
+                    continue
                 if S["targets"] and S["lanes"]:
                     try:
                         S["layouts"][name] = automatic_layout(
@@ -631,54 +1238,75 @@ with tabs[0]:
             with cols[i % len(cols)]:
                 st.image(image_io.to_display(img), width=int(S["thumb_width"]),
                          caption=f"{name}  ·  {img.width}×{img.height}  ·  {img.bit_depth}-bit", clamp=True)
-                with st.expander("Straighten scan with alignment grid", expanded=False):
-                    original = S["original_blots"].get(name, img)
-                    angle_key = f"align_angle_{name}"
-                    pending_angle_key = f"_pending_align_angle_{name}"
-                    if pending_angle_key in S:
-                        S[angle_key] = float(S.pop(pending_angle_key))
-                    if angle_key not in S:
-                        S[angle_key] = float(S["alignment_applied"].get(name, 0.0))
-                    if st.button("Estimate angle automatically", key=f"auto_align_{name}"):
-                        with st.spinner("Estimating the band angle locally..."):
-                            S[angle_key] = alignment.estimate_correction_angle(original.gray)
-                        st.rerun()
-                    angle = st.slider(
-                        "Correction angle (degrees)", -15.0, 15.0,
-                        step=0.1, key=angle_key,
-                        help="Positive rotates counter-clockwise. Adjust until bands follow the horizontal grid lines.",
-                    )
-                    max_grid = max(12, min(300, min(original.width, original.height) // 2))
-                    default_grid = min(max_grid, max(12, min(original.width, original.height) // 6))
-                    grid_step = st.slider(
-                        "Grid spacing (px)", 8, max_grid, default_grid,
-                        key=f"align_grid_{name}",
-                    )
-                    preview = alignment.rotate_loaded(original, angle)
-                    align_fig = _alignment_figure(preview, grid_step)
-                    st.pyplot(align_fig, width="stretch")
-                    plt.close(align_fig)
+                if evaluation_task_locked:
                     st.caption(
-                        "The cyan grid is a visual guide only and is never written into the image. "
-                        "Apply the correction before band detection and quantification."
+                        "Blinded evaluator task: straightening is locked at "
+                        "0.0° so ROI coordinates stay on the original sealed pixels."
                     )
-                    apply_col, reset_col = st.columns(2)
-                    if apply_col.button("Apply straightening", type="primary",
-                                        key=f"apply_align_{name}"):
-                        S["blots"][name] = alignment.rotate_loaded(original, angle)
-                        S["alignment_applied"][name] = float(angle)
-                        _reset_image_analysis(name)
-                        st.rerun()
-                    if reset_col.button("Reset to uploaded image", key=f"reset_align_{name}"):
-                        S["blots"][name] = alignment.rotate_loaded(original, 0.0)
-                        S["alignment_applied"][name] = 0.0
-                        S[pending_angle_key] = 0.0
-                        _reset_image_analysis(name)
-                        st.rerun()
-                    applied_angle = float(S["alignment_applied"].get(name, 0.0))
-                    st.caption(f"Working scan correction: {applied_angle:+.1f}°")
-                S["replicate"][name] = st.number_input(f"Replicate # for {name}", 1, 99,
-                                                       S["replicate"].get(name, 1), key=f"rep_{name}")
+                else:
+                    with st.expander("Straighten scan with alignment grid", expanded=False):
+                        original = S["original_blots"].get(name, img)
+                        angle_key = f"align_angle_{name}"
+                        pending_angle_key = f"_pending_align_angle_{name}"
+                        if pending_angle_key in S:
+                            S[angle_key] = float(S.pop(pending_angle_key))
+                        if angle_key not in S:
+                            S[angle_key] = float(S["alignment_applied"].get(name, 0.0))
+                        if st.button("Estimate angle automatically", key=f"auto_align_{name}"):
+                            with st.spinner("Estimating the band angle locally..."):
+                                S[angle_key] = alignment.estimate_correction_angle(original.gray)
+                            st.rerun()
+                        angle = st.slider(
+                            "Correction angle (degrees)", -15.0, 15.0,
+                            step=0.1, key=angle_key,
+                            help="Positive rotates counter-clockwise. Adjust until bands follow the horizontal grid lines.",
+                        )
+                        max_grid = max(12, min(300, min(original.width, original.height) // 2))
+                        default_grid = min(max_grid, max(12, min(original.width, original.height) // 6))
+                        grid_step = st.slider(
+                            "Grid spacing (px)", 8, max_grid, default_grid,
+                            key=f"align_grid_{name}",
+                        )
+                        preview = alignment.rotate_loaded(original, angle)
+                        align_fig = _alignment_figure(preview, grid_step)
+                        st.pyplot(align_fig, width="stretch")
+                        plt.close(align_fig)
+                        st.caption(
+                            "The cyan grid is a visual guide only and is never written into the image. "
+                            "Apply the correction before band detection and quantification."
+                        )
+                        apply_col, reset_col = st.columns(2)
+                        if apply_col.button("Apply straightening", type="primary",
+                                            key=f"apply_align_{name}"):
+                            S["blots"][name] = alignment.rotate_loaded(original, angle)
+                            S["alignment_applied"][name] = float(angle)
+                            _reset_image_analysis(name)
+                            st.rerun()
+                        if reset_col.button("Reset to uploaded image", key=f"reset_align_{name}"):
+                            S["blots"][name] = alignment.rotate_loaded(original, 0.0)
+                            S["alignment_applied"][name] = 0.0
+                            S[pending_angle_key] = 0.0
+                            _reset_image_analysis(name)
+                            st.rerun()
+                        applied_angle = float(S["alignment_applied"].get(name, 0.0))
+                        st.caption(f"Working scan correction: {applied_angle:+.1f}°")
+                image_metadata_columns = st.columns(2)
+                S["replicate"][name] = image_metadata_columns[0].number_input(
+                    f"Replicate # for {name}", 1, 99,
+                    S["replicate"].get(name, 1), key=f"rep_{name}")
+                S["study_group"][name] = image_metadata_columns[1].text_input(
+                    f"Study / split group for {name}",
+                    value=str(S["study_group"].get(name, "")),
+                    key=f"study_group_{name}",
+                    help="Use the same ID for related exposures or crops. Keep a "
+                         "group entirely in train or validation to avoid leakage.",
+                ).strip()
+                study_group_present = bool(S["study_group"][name])
+                if not study_group_present:
+                    image_metadata_columns[1].warning(
+                        "Required before approving training labels. Related "
+                        "exposures and crops must share one group."
+                    )
                 layout = S["layouts"].get(name, {})
                 dark = layout.get("bands_dark", S["bands_dark"])
                 sat = image_io.saturated_mask(img, bands_are_dark=dark).mean() * 100
@@ -704,7 +1332,11 @@ with tabs[0]:
                             st.caption(
                                 f"Text recognition ({confidence}%): "
                                 f"{', '.join(scan.targets)} · {lane_note}")
-                        if st.button("Apply these labels", key=f"apply_labels_{name}"):
+                        if st.button(
+                            "Apply these labels",
+                            key=f"apply_labels_{name}",
+                            disabled=evaluation_task_locked,
+                        ):
                             _queue_detected_metadata(scan, name)
                             st.rerun()
                         if scan.warning:
@@ -714,9 +1346,15 @@ with tabs[0]:
                 elif scan:
                     st.warning(str(scan))
         if st.button("Clear all blots"):
-            for k in ("blots", "original_blots", "alignment_applied", "layouts",
-                      "replicate", "label_scans"):
+            cleared_names = list(S.get("blots", {}))
+            for k in ("blots", "original_blots", "alignment_applied",
+                      "image_provenance", "layouts",
+                      "replicate", "study_group", "annotation_complete",
+                      "label_scans"):
                 S[k] = {}
+            S["evaluation_task"] = {}
+            S["upload_generation"] = int(S.get("upload_generation", 0)) + 1
+            S["_pending_image_widget_clear"] = cleared_names
             _invalidate_results()
             S["metadata_autofill_done"] = False
             S["metadata_source"] = ""
@@ -735,18 +1373,34 @@ with tabs[1]:
         st.error("Add at least one target and one lane in Experiment setup.")
     else:
         name = st.selectbox("Blot to lay out", list(S["blots"].keys()))
+        if evaluation_task_locked and name not in S["layouts"]:
+            st.error(
+                "This blinded evaluator task has no sealed proposal layout for "
+                "the selected image. Re-import the original task."
+            )
+            st.stop()
         img = S["blots"][name]
         layout = S["layouts"].setdefault(name, default_layout(img, S["targets"], len(S["lanes"])))
         detect_col, fallback_col, status_col = st.columns([1.1, 1.0, 2.2])
-        if detect_col.button("Detect all bands", type="primary", key=f"detect_{name}"):
+        if detect_col.button(
+            "Detect all bands",
+            type="primary",
+            key=f"detect_{name}",
+            disabled=evaluation_task_locked,
+        ):
             try:
                 layout = automatic_layout(img, S["targets"], S["lanes"])
                 S["layouts"][name] = layout
                 _invalidate_results()
                 _clear_roi_widget_state(name)
+                _invalidate_annotation_review(name)
             except ValueError as exc:
                 st.error(str(exc))
-        if fallback_col.button("Use even grid", key=f"grid_{name}"):
+        if fallback_col.button(
+            "Use even grid",
+            key=f"grid_{name}",
+            disabled=evaluation_task_locked,
+        ):
             layout = default_layout(img, S["targets"], len(S["lanes"]))
             layout["mode"] = "grid"
             if S["polarity_mode"] == "auto":
@@ -760,6 +1414,7 @@ with tabs[1]:
             S["layouts"][name] = layout
             _invalidate_results()
             _clear_roi_widget_state(name)
+            _invalidate_annotation_review(name)
 
         if "rois" in layout:
             shared_roi_size = _ensure_shared_roi_size(layout, img)
@@ -768,9 +1423,18 @@ with tabs[1]:
             review_count = sum(bool(r.get("review_required", False)) for r in layout["rois"])
             excluded_count = len(layout["rois"]) - active_count
             polarity_text = "dark on light" if layout.get("bands_dark", True) else "light on dark"
+            backend_text = (
+                "AI hybrid"
+                if layout.get("detection_backend") == "ai_hybrid"
+                else (
+                    "GelGenie hybrid"
+                    if layout.get("detection_backend") == "gelgenie_hybrid"
+                    else "classical"
+                )
+            )
             status_text = (
                 f"{active_count} active · {excluded_count} excluded · "
-                f"{review_count} need review · {polarity_text}"
+                f"{review_count} need review · {polarity_text} · {backend_text}"
             )
             if review_count:
                 status_col.warning(status_text)
@@ -778,6 +1442,12 @@ with tabs[1]:
                 status_col.success(status_text)
             for warning in layout.get("detection_warnings", []):
                 st.warning(warning)
+            sam_notice = S.pop(f"_sam_notice_{name}", None)
+            if isinstance(sam_notice, dict):
+                if sam_notice.get("kind") == "success":
+                    st.success(str(sam_notice.get("message", "")))
+                else:
+                    st.error(str(sam_notice.get("message", "")))
 
             with st.expander("Display & panel size", expanded=False):
                 view_cols = st.columns([1.2, 1.2, 1.2, 1.4])
@@ -825,6 +1495,7 @@ with tabs[1]:
                     display_width=display_width,
                     viewport_height=int(S["roi_panel_height"]),
                     selected_roi_id=selected_roi_id,
+                    allow_resize=not evaluation_task_locked,
                 )
                 st.caption(
                     "Green = accepted · red = accepted loading control · "
@@ -835,8 +1506,15 @@ with tabs[1]:
                 event_id = str(editor_event["event_id"])
                 if S.get(event_key) != event_id:
                     S[event_key] = event_id
-                    if _apply_roi_editor_event(layout, editor_event, S["lanes"], img):
+                    if _apply_roi_editor_event(
+                        layout,
+                        editor_event,
+                        S["lanes"],
+                        img,
+                        allow_resize=not evaluation_task_locked,
+                    ):
                         _invalidate_results()
+                        _invalidate_annotation_review(name)
                     st.rerun()
 
             stale_targets = {r.get("target") for r in layout["rois"]} - set(S["targets"])
@@ -868,6 +1546,7 @@ with tabs[1]:
                             S["lanes"], int(manual_count))
                         _invalidate_results()
                         _clear_roi_widget_state(name)
+                        _invalidate_annotation_review(name)
                         if added_ids:
                             S[f"_select_roi_{name}"] = added_ids[-1]
                         st.rerun()
@@ -878,32 +1557,49 @@ with tabs[1]:
                     )
 
                 with st.expander("Locked rectangle size", expanded=True):
-                    st.caption("These dimensions are applied to every measurement ROI. Dragging any on-image handle updates the same values automatically.")
+                    st.caption(
+                        "Evaluator tasks preserve the frozen review dimensions; "
+                        "move, add, or disable boxes without resizing them."
+                        if evaluation_task_locked
+                        else (
+                            "These dimensions are applied to every measurement "
+                            "ROI. Dragging any on-image handle updates the same "
+                            "values automatically."
+                        )
+                    )
                     with st.form(f"roi_size_form_{name}"):
                         size_columns = st.columns(2)
                         width = size_columns[0].number_input(
                             "Width (px)", 1, img.width, int(shared_roi_size["w"]), 1,
+                            disabled=evaluation_task_locked,
                             key=f"roi_width_{name}")
                         height = size_columns[1].number_input(
                             "Height (px)", 1, img.height, int(shared_roi_size["h"]), 1,
+                            disabled=evaluation_task_locked,
                             key=f"roi_height_{name}")
                         apply_roi_size = st.form_submit_button(
-                            "Apply size to every band", type="primary")
+                            "Apply size to every band",
+                            type="primary",
+                            disabled=evaluation_task_locked,
+                        )
                     if apply_roi_size:
                         layout["roi_size"] = {"w": int(width), "h": int(height)}
                         _ensure_shared_roi_size(layout, img)
                         _invalidate_results()
+                        _invalidate_annotation_review(name)
                         S.pop(f"roi_table_{name}", None)
                         st.rerun()
 
                 roi_columns = [
-                    "roi_id", "use", "status", "review_required", "source",
+                    "roi_id", "use", "annotation_approved", "status",
+                    "review_required", "source",
                     "target", "lane", "x", "y", "w", "h", "confidence",
                     "component_count", "profile_span",
                 ]
                 roi_df = pd.DataFrame(layout["rois"])
                 roi_defaults = {
                     "use": True,
+                    "annotation_approved": False,
                     "status": "manual",
                     "review_required": False,
                     "source": "manual",
@@ -925,6 +1621,10 @@ with tabs[1]:
                     column_config={
                         "roi_id": None,
                         "use": st.column_config.CheckboxColumn("Use", default=True),
+                        "annotation_approved": st.column_config.CheckboxColumn(
+                            "AI label",
+                            default=False,
+                            help="Include this human-reviewed box as training ground truth."),
                         "status": st.column_config.TextColumn("Status", disabled=True),
                         "review_required": st.column_config.CheckboxColumn(
                             "Review", disabled=True),
@@ -949,8 +1649,45 @@ with tabs[1]:
                 )
                 st.caption(
                     "Fallback ROIs are excluded by default. Enable Use only after "
-                    "checking the blot. Width/height remain globally locked."
+                    "checking the blot. Mark AI label only after checking the box, "
+                    "target, and lane; geometry changes clear that approval. "
+                    "Width/height remain globally locked."
                 )
+                approval_attestation = st.checkbox(
+                    "I reviewed the entire working image: every true band is "
+                    "boxed, false boxes are disabled, and target/lane assignments "
+                    "are correct",
+                    key=f"approve_attestation_{name}",
+                )
+                approval_actions = st.columns(2)
+                if approval_actions[0].button(
+                        "Approve all active AI labels",
+                        disabled=(
+                            not approval_attestation
+                            or not study_group_present
+                        ),
+                        key=f"approve_all_rois_{name}"):
+                    for roi in layout["rois"]:
+                        roi["annotation_approved"] = _literal_checkbox(
+                            roi.get("use", True)
+                        )
+                    has_active_roi = any(
+                        _literal_checkbox(roi.get("use", True))
+                        for roi in layout["rois"]
+                    )
+                    layout["annotation_complete"] = True
+                    layout["negative_image"] = not has_active_roi
+                    S.setdefault("annotation_complete", {})[name] = True
+                    S.pop(f"roi_table_{name}", None)
+                    st.rerun()
+                if approval_actions[1].button(
+                        "Clear AI label approvals",
+                        key=f"clear_all_rois_{name}"):
+                    for roi in layout["rois"]:
+                        roi["annotation_approved"] = False
+                    _invalidate_annotation_review(name)
+                    S.pop(f"roi_table_{name}", None)
+                    st.rerun()
 
                 profile_rois = list(layout["rois"])
                 if profile_rois:
@@ -1009,7 +1746,23 @@ with tabs[1]:
                             "profile-guided integration; the full locked width "
                             "is retained for consistent lane sampling."
                         )
+                        if st.button(
+                            "Refine this ROI position with SAM 2.1",
+                            key=f"sam_refine_{name}_{selected_profile_id}",
+                            disabled=evaluation_task_locked,
+                            help=(
+                                "Experimental: SAM receives this box as a prompt "
+                                "and may recenter it. Width/height and native-pixel "
+                                "densitometry remain unchanged."
+                            ),
+                        ):
+                            S[f"_pending_sam_refinement_{name}"] = str(
+                                selected_profile_id
+                            )
 
+            old_rois_by_id = {
+                str(roi.get("roi_id", "")): roi for roi in layout["rois"]
+            }
             old_signature = [
                 tuple(roi.get(key) for key in ("roi_id", "use", "target", "lane", "x", "y", "w", "h"))
                 for roi in layout["rois"]
@@ -1026,10 +1779,11 @@ with tabs[1]:
                 w, h = int(shared_roi_size["w"]), int(shared_roi_size["h"])
                 confidence = record.get("confidence", 0.0)
                 confidence = 0.0 if pd.isna(confidence) else float(confidence)
-                use = record.get("use", True)
-                use = True if pd.isna(use) else bool(use)
+                use = _literal_checkbox(record.get("use", True))
+                annotation_approved = record.get("annotation_approved", False)
+                annotation_approved = _literal_checkbox(annotation_approved)
                 review_required = record.get("review_required", False)
-                review_required = False if pd.isna(review_required) else bool(review_required)
+                review_required = _literal_checkbox(review_required)
                 component_count = record.get("component_count", 1)
                 component_count = 1 if pd.isna(component_count) else max(0, int(component_count))
                 profile_span = record.get("profile_span", 0.0)
@@ -1040,7 +1794,9 @@ with tabs[1]:
                     previous_w, previous_h = w, h
                 cleaned_roi = {
                     "roi_id": str(record.get("roi_id", "")),
-                    "use": use, "target": record["target"], "lane": record["lane"],
+                    "use": use,
+                    "annotation_approved": annotation_approved,
+                    "target": record["target"], "lane": record["lane"],
                     "x": x, "y": y, "w": previous_w, "h": previous_h,
                     "confidence": confidence,
                     "source": str(record.get("source") or "manual"),
@@ -1050,6 +1806,11 @@ with tabs[1]:
                     "profile_span": profile_span,
                 }
                 _resize_roi_centered(cleaned_roi, w, h, img)
+                previous = old_rois_by_id.get(cleaned_roi["roi_id"])
+                if previous is not None and any(
+                        previous.get(key) != cleaned_roi.get(key)
+                        for key in ("use", "target", "lane", "x", "y", "w", "h")):
+                    cleaned_roi["annotation_approved"] = False
                 cleaned_rois.append(cleaned_roi)
             new_signature = [
                 tuple(roi.get(key) for key in ("roi_id", "use", "target", "lane", "x", "y", "w", "h"))
@@ -1057,8 +1818,92 @@ with tabs[1]:
             ]
             if new_signature != old_signature:
                 _invalidate_results()
+                _invalidate_annotation_review(name)
+            old_approval_signature = [
+                (
+                    str(roi.get("roi_id", "")),
+                    _literal_checkbox(roi.get("annotation_approved", False)),
+                )
+                for roi in layout["rois"]
+            ]
+            new_approval_signature = [
+                (
+                    str(roi.get("roi_id", "")),
+                    _literal_checkbox(roi.get("annotation_approved", False)),
+                )
+                for roi in cleaned_rois
+            ]
+            if new_approval_signature != old_approval_signature:
+                _invalidate_annotation_review(name)
             layout["rois"] = cleaned_rois
             _ensure_roi_ids(layout)
+            pending_sam_roi_id = S.pop(
+                f"_pending_sam_refinement_{name}", None
+            )
+            if pending_sam_roi_id is not None:
+                selected_roi = next(
+                    (
+                        roi
+                        for roi in layout["rois"]
+                        if str(roi.get("roi_id")) == str(pending_sam_roi_id)
+                    ),
+                    None,
+                )
+                if selected_roi is None:
+                    S[f"_sam_notice_{name}"] = {
+                        "kind": "error",
+                        "message": "The selected ROI no longer exists.",
+                    }
+                else:
+                    previous_roi = copy.deepcopy(selected_roi)
+                    try:
+                        refinement = sam_refiner.refine_box(
+                            image_io.to_display(img),
+                            selected_roi,
+                            S.get(
+                                "sam_checkpoint",
+                                sam_refiner.DEFAULT_CHECKPOINT_PATH,
+                            ),
+                            device=S.get("sam_device", "auto"),
+                            context_scale=S.get("sam_context_scale", 4.0),
+                        )
+                        updated_roi = sam_refiner.recenter_fixed_roi(
+                            selected_roi,
+                            refinement,
+                            shared_roi_size,
+                            img.gray.shape,
+                        )
+                        selected_roi.clear()
+                        selected_roi.update(updated_roi)
+                        history = layout.setdefault(
+                            "roi_refinement_history", []
+                        )
+                        history.append(
+                            sam_refiner.refinement_history_entry(
+                                str(pending_sam_roi_id),
+                                previous_roi,
+                                selected_roi,
+                                refinement,
+                            )
+                        )
+                        layout["roi_refinement_history"] = history[-100:]
+                        _invalidate_results()
+                        _invalidate_annotation_review(name)
+                        _clear_roi_widget_state(name)
+                        S[f"_select_roi_{name}"] = str(pending_sam_roi_id)
+                        S[f"_sam_notice_{name}"] = {
+                            "kind": "success",
+                            "message": (
+                                "SAM recentered the ROI while preserving the "
+                                "locked measurement size. Review and approve it."
+                            ),
+                        }
+                    except sam_refiner.SAMRefinerError as exc:
+                        S[f"_sam_notice_{name}"] = {
+                            "kind": "error",
+                            "message": str(exc),
+                        }
+                st.rerun()
         else:
             status_col.info("Even-grid fallback: align the shared boxes manually.")
             # ensure the legacy coarse layout has all current targets/lanes

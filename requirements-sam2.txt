@@ -1,0 +1,4 @@
+# Optional experimental ROI-position refinement. Pinned to the audited official
+# SAM 2 repository revision; scripts/setup_ubuntu.sh disables its custom CUDA
+# extension build because BlotGrid needs ordinary PyTorch inference only.
+SAM-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4

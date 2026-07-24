@@ -6,8 +6,16 @@ __pycache__/
 .*
 !.gitignore
 smoke_plot.png
+models/
+data/
+runs/
+graphify-out/
 
 # Local development context and instruction artifacts are never published.
+HANDOFF*.md
+handoff*.md
+HANDOUT*.md
+handout*.md
 *prompt*.md
 *PROMPT*.md
 *training*.md
@@ -18,3 +26,18 @@ smoke_plot.png
 *AGENT*.md
 *assistant*.md
 *ASSISTANT*.md
+*analysis*.md
+*ANALYSIS*.md
+*audit*.md
+*AUDIT*.md
+*memory*.md
+*MEMORY*.md
+*recommendation*.md
+*RECOMMENDATION*.md
+*suggestion*.md
+*SUGGESTION*.md
+local-notes/
+
+# These completed local training records are intentionally absent from GitHub.
+docs/UBUNTU_AI_GUIDE.md
+docs/PUBLIC_BOOTSTRAP_MODEL.md
