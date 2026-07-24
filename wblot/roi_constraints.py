@@ -44,6 +44,8 @@ def apply_editor_event(
     event: dict,
     image_width: int,
     image_height: int,
+    *,
+    allow_resize: bool = True,
 ) -> bool:
     """Apply a canvas event without trusting its per-ROI rectangle sizes.
 
@@ -62,6 +64,8 @@ def apply_editor_event(
     selected = next(
         (roi for roi in rois if str(roi.get("roi_id")) == selected_id), None)
     action = str(event.get("action", ""))
+    if action.startswith("resize") and not allow_resize:
+        return False
 
     if action.startswith("resize") and selected is not None:
         selected_update = incoming.get(selected_id, {})

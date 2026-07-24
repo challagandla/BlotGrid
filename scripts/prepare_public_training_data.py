@@ -18,7 +18,6 @@ from pathlib import Path, PurePosixPath
 import platform
 import shutil
 import stat
-import sys
 import tempfile
 from typing import Any, Iterable
 import urllib.request
@@ -33,7 +32,10 @@ from scipy import ndimage
 
 ZENODO_RECORD = "14641949"
 ZENODO_DOI = "10.5281/zenodo.14641949"
+ZENODO_CONCEPT_DOI = "10.5281/zenodo.13218468"
 ZENODO_BASE = f"https://zenodo.org/api/records/{ZENODO_RECORD}/files"
+RGP_DATABASE_DOI = "10.18908/lsdba.nbdc00318-05-000"
+RGP_DOI = "10.18908/lsdba.nbdc00318-05-002"
 RGP_URL = (
     "https://dbarchive.biosciencedbc.jp/data/rgp-caps/LATEST/"
     "rgp_caps_electrophoresis_image.zip"
@@ -42,7 +44,8 @@ RGP_LICENSE_URL = "https://dbarchive.biosciencedbc.jp/en/rgp-caps/lic.html"
 RGP_ATTRIBUTION = (
     "RGP: 332 PCR-based genetic markers on rice chromosomes "
     "© National Institute of Agrobiological Sciences licensed under "
-    "CC Attribution-Share Alike 2.1 Japan"
+    "CC Attribution-Share Alike 2.1 Japan; "
+    f"doi:{RGP_DOI}"
 )
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_EXTRACTED_BYTES = 50 * 1024**3
@@ -122,6 +125,45 @@ GELGENIE_CITATION = (
     "(2025). Segmented Gel Electrophoresis Images used for Training GelGenie "
     "Models (v3). Zenodo. https://doi.org/10.5281/zenodo.14641949"
 )
+PUBLIC_DATA_SOURCES = (
+    {
+        "id": "gelgenie_v3",
+        "name": (
+            "Segmented Gel Electrophoresis Images used for Training "
+            "GelGenie Models"
+        ),
+        "record": ZENODO_RECORD,
+        "doi": ZENODO_DOI,
+        "concept_doi": ZENODO_CONCEPT_DOI,
+        "url": f"https://zenodo.org/records/{ZENODO_RECORD}",
+        "license_id": 1,
+        "required_attribution": GELGENIE_CITATION,
+        "publication_assessment": {
+            "status": "cleared",
+            "redistribution_cleared": True,
+            "attribution_resolved": True,
+            "license_id": 1,
+        },
+    },
+    {
+        "id": "rgp_caps",
+        "name": "RGP caps images of gel electrophoresis",
+        "doi": RGP_DOI,
+        "database_doi": RGP_DATABASE_DOI,
+        "url": f"https://doi.org/{RGP_DOI}",
+        "license_id": 2,
+        "required_attribution": RGP_ATTRIBUTION,
+        "publication_assessment": {
+            "status": "cleared",
+            "redistribution_cleared": True,
+            "attribution_resolved": True,
+            "license_id": 2,
+        },
+    },
+)
+PUBLIC_DATA_SOURCES_BY_ID = {
+    str(source["id"]): source for source in PUBLIC_DATA_SOURCES
+}
 SOURCES = tuple(
     SourceFile(
         name=name,
@@ -850,7 +892,16 @@ def build_outputs(
     coco_annotations: list[dict[str, Any]] = []
     split = {"train": [], "val": []}
     annotation_id = 1
+    used_source_ids: set[str] = set()
     for image_id, record in enumerate(usable, start=1):
+        source_id = (
+            "rgp_caps"
+            if record["image_source_archive"]
+            == "rgp_caps_electrophoresis_image.zip"
+            else "gelgenie_v3"
+        )
+        source_lineage = PUBLIC_DATA_SOURCES_BY_ID[source_id]
+        used_source_ids.add(source_id)
         safe_source = Path(record["source_archive"]).stem.replace(" ", "_")
         filename = (
             f"{safe_source}__{record['partition']}__"
@@ -871,12 +922,7 @@ def build_outputs(
                 "file_name": filename,
                 "width": record["width"],
                 "height": record["height"],
-                "license": (
-                    2
-                    if record["image_source_archive"]
-                    == "rgp_caps_electrophoresis_image.zip"
-                    else 1
-                ),
+                "license": int(source_lineage["license_id"]),
                 "blotgrid": {
                     "annotation_complete": True,
                     "negative_image": False,
@@ -885,6 +931,12 @@ def build_outputs(
                         f"public:{Path(record['source_archive']).stem}:"
                         f"{record['image_sha256']}"
                     ),
+                    "source_id": source_id,
+                    "source_doi": source_lineage["doi"],
+                    "source_url": source_lineage["url"],
+                    "required_attribution": source_lineage[
+                        "required_attribution"
+                    ],
                     "source_archive": record["source_archive"],
                     "image_source_archive": record["image_source_archive"],
                     "source_partition": record["partition"],
@@ -909,6 +961,9 @@ def build_outputs(
                     "attributes": {
                         "annotation_origin": "upstream_hand_labelled_mask_component",
                         "source_mask_sha256": record["mask_sha256"],
+                        "annotation_approved": True,
+                        "pseudo_label": False,
+                        "review_required": False,
                     },
                 }
             )
@@ -933,13 +988,17 @@ def build_outputs(
             else:
                 path.unlink(missing_ok=True)
 
+    used_sources = [
+        dict(PUBLIC_DATA_SOURCES_BY_ID[source_id])
+        for source_id in sorted(used_source_ids)
+    ]
     annotations_payload = {
         "info": {
             "description": (
                 "Out-of-domain GelGenie v3 public gel-electrophoresis bootstrap "
                 "boxes; not a Western-blot validation cohort."
             ),
-            "source_doi": ZENODO_DOI,
+            "source_dois": [source["doi"] for source in used_sources],
             "license": (
                 "Mixed: GelGenie items CC BY 4.0; RGP-origin LSDB images "
                 "CC BY-SA 2.1 Japan"
@@ -951,16 +1010,38 @@ def build_outputs(
                 "id": 1,
                 "name": "Creative Commons Attribution 4.0 International",
                 "url": "https://creativecommons.org/licenses/by/4.0/",
+                "spdx_identifier": "CC-BY-4.0",
+                "publication_assessment": {
+                    "status": "cleared",
+                    "redistribution_cleared": True,
+                    "commercial_use_cleared": True,
+                    "attribution_required": True,
+                    "share_alike_required": False,
+                    "obligations": ["attribution"],
+                },
             },
             {
                 "id": 2,
                 "name": "Creative Commons Attribution-ShareAlike 2.1 Japan",
-                "url": RGP_LICENSE_URL,
+                "url": "https://creativecommons.org/licenses/by-sa/2.1/jp/",
+                "spdx_identifier": "CC-BY-SA-2.1-JP",
+                "publication_assessment": {
+                    "status": "cleared",
+                    "redistribution_cleared": True,
+                    "commercial_use_cleared": True,
+                    "attribution_required": True,
+                    "share_alike_required": True,
+                    "obligations": ["attribution", "share_alike"],
+                },
             },
         ],
         "categories": [{"id": 1, "name": "band", "supercategory": "gel"}],
         "images": coco_images,
         "annotations": coco_annotations,
+        "blotgrid": {
+            "license_lineage_schema_version": 1,
+            "sources": used_sources,
+        },
     }
     heldout_payload = {
         "description": (
@@ -997,6 +1078,7 @@ def build_outputs(
             "gelgenie": {
                 "record": ZENODO_RECORD,
                 "doi": ZENODO_DOI,
+                "concept_doi": ZENODO_CONCEPT_DOI,
                 "license": "CC BY 4.0",
                 "record_url": f"https://zenodo.org/records/{ZENODO_RECORD}",
                 "creators": GELGENIE_CREATORS,
@@ -1006,7 +1088,7 @@ def build_outputs(
                 "published_counts_by_archive": EXPECTED_LABELLED_IMAGES,
             },
             "rgp_caps": {
-                "doi": "10.18908/lsdba.nbdc00318-05-000",
+                "doi": RGP_DOI,
                 "license": "CC BY-SA 2.1 Japan",
                 "license_url": RGP_LICENSE_URL,
                 "required_attribution": RGP_ATTRIBUTION,
@@ -1055,8 +1137,13 @@ def build_outputs(
             "environment": {
                 "python_version": platform.python_version(),
                 "python_implementation": platform.python_implementation(),
-                "platform": platform.platform(),
-                "executable": sys.executable,
+                "platform": {
+                    "system": platform.system(),
+                    "release": platform.release(),
+                    "machine": platform.machine(),
+                    "libc_name": platform.libc_ver()[0],
+                    "libc_version": platform.libc_ver()[1],
+                },
                 "numpy_version": np.__version__,
                 "pillow_version": PILLOW_VERSION,
                 "scipy_version": scipy.__version__,

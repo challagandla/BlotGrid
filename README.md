@@ -10,6 +10,8 @@ aggregate replicates, and export publication-quality bar charts.
 
 [Beginner tutorial](docs/BEGINNER_TUTORIAL.md) ·
 [Pretrained model workflow](docs/PRETRAINED_MODELS.md) ·
+[Holdout evaluation schema](docs/HOLDOUT_EVALUATION.md) ·
+[Third-party models](THIRD_PARTY_MODELS.md) ·
 [Third-party data](THIRD_PARTY_DATA.md) ·
 [MIT license](LICENSE)
 
@@ -57,6 +59,57 @@ and application use.
 AI changes only the proposed ROI locations. BlotGrid still measures
 background-corrected intensity from the original native-depth pixels with its
 auditable classical densitometry.
+
+### Sealed detector comparison
+
+The optional evaluator compares the classical detector, verified GelGenie
+model, and one local format-2 detector checkpoint carrying publication metadata
+schema 2 on the same untouched holdout images. Its generated sidecar, embedded
+metadata, model state, and container are verified before use. The band cohort
+must be reviewed and approved by a person in BlotGrid, with
+human-approved artifact regions added to the holdout COCO record before it is
+sealed; the evaluator will not create or infer ground truth.
+
+Prepare randomized, method-blinded review tasks:
+
+```bash
+.venv/bin/python scripts/evaluate_detector.py prepare \
+  --annotations data/holdout/annotations.json \
+  --images data/holdout/images \
+  --seal data/holdout/seal.json \
+  --development-ledger data/development_ledger.json \
+  --plan data/holdout/evaluation_plan.json \
+  --checkpoint models/detector.pt \
+  --gelgenie-model models/gelgenie_universal.onnx \
+  --output runs/holdout-001
+```
+
+Give the reviewer `runs/holdout-001/reviewer_packet/` plus read-only access to
+the exact sealed `--images` directory through a separate channel. Do not give
+them the annotations, seal, or `evaluator_private/`. The packet contains the
+randomized task order and blinded project JSON files, but neither method
+identities nor ground truth. For each task, the reviewer restores its project
+in BlotGrid, re-uploads the sealed images (project JSON never embeds pixels),
+inspects the whole image, corrects and approves every active ROI, and saves the
+reviewed project under the task's original `<task-id>.json` filename in a
+separate directory. Evaluator ROI dimensions are frozen: reviewers may move,
+add, or disable fixed-size boxes, but the resize handles and size controls are
+locked. Then score the three reviewed projects:
+
+```bash
+.venv/bin/python scripts/evaluate_detector.py score \
+  --run runs/holdout-001 \
+  --reviewed-projects data/holdout/reviewed-projects \
+  --review-attestation data/holdout/review-attestation.json
+```
+
+The seal, complete development/model-selection ledger, checkpoint ancestry,
+review bindings, and every frozen input are hash-checked again at scoring.
+Outputs report clear/faint recall, border/text/smear/blank false positives,
+one-to-one IoU and centre errors, doublet recovery, equal-review edits,
+native-pixel intensity/fold-change errors, and scanner/exposure/target/
+background/acquisition-style strata. Runs stay under ignored `runs/` or
+`data/` directories and contain only JSON/CSV artifacts.
 
 ## Workflow (tabs, left to right)
 
@@ -191,6 +244,7 @@ wblot/
   project_io.py        save/load project JSON
   ml_detector.py       optional TorchVision ROI proposals and checkpoint provenance
   ml_training.py       reviewed-annotation export, safe splits, training/evaluation
+  holdout_evaluation.py sealed holdout validation, matching, and paired errors
   gelgenie.py          verified pretrained ONNX segmentation-to-ROI adapter
   sam_refiner.py       optional fixed-size ROI recentering with SAM 2.1
 scripts/
@@ -200,9 +254,15 @@ scripts/
   smoke_pretrained_models.py
   export_project_annotations.py
   train_detector.py
+  check_checkpoint_release.py
+  evaluate_detector.py
 make_sample_blot.py    generates a synthetic 3x3 demo blot
 test_core.py           core unit tests
 test_ml_support.py     AI/export safety tests (Torch is imported only when needed)
+test_app_evaluator_policy.py evaluator-review UI lock tests
+test_checkpoint_release.py checkpoint/sidecar release-binding tests
+test_holdout_evaluation.py sealed comparison and native-pixel metric tests
+test_holdout_security.py evaluator privacy and aggregation security tests
 ```
 
 ## Tests
@@ -210,7 +270,10 @@ test_ml_support.py     AI/export safety tests (Torch is imported only when neede
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q \
-  test_core.py test_ml_support.py test_sam_refiner.py
+  test_core.py test_ml_support.py test_sam_refiner.py \
+  test_public_training_data.py test_checkpoint_release.py \
+  test_holdout_evaluation.py test_holdout_security.py \
+  test_app_evaluator_policy.py
 ```
 
 Covers OCR label classification and unlabeled-lane inference, automatic dark/light

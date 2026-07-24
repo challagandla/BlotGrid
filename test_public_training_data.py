@@ -224,6 +224,15 @@ def test_prepare_quarantines_leakage_and_writes_verified_coco(tmp_path):
         "quarantined_image_groups": 1,
         "quarantined_records": 2,
     }
+    environment = manifest["conversion"]["environment"]
+    assert "executable" not in environment
+    assert set(environment["platform"]) == {
+        "system",
+        "release",
+        "machine",
+        "libc_name",
+        "libc_version",
+    }
     annotations = json.loads((output / "annotations.json").read_text())
     split = json.loads((output / "split.json").read_text())
     heldout = json.loads((output / "heldout.json").read_text())
@@ -246,6 +255,10 @@ def test_prepare_quarantines_leakage_and_writes_verified_coco(tmp_path):
         generated = output / "images" / image["file_name"]
         assert public_data._digest(generated) == image["blotgrid"]["original_sha256"]
         assert image["blotgrid"]["out_of_domain"] is True
+    for annotation in annotations["annotations"]:
+        assert annotation["attributes"]["annotation_approved"] is True
+        assert annotation["attributes"]["pseudo_label"] is False
+        assert annotation["attributes"]["review_required"] is False
 
     first_hashes = {
         name: public_data._digest(output / name)
@@ -337,3 +350,33 @@ def test_rgp_origin_gets_share_alike_image_license(tmp_path):
     assert licenses["rgp_caps_electrophoresis_image.zip"] == 2
     assert licenses["nathan_gels.zip"] == 1
     assert annotations["info"]["license"].startswith("Mixed:")
+    assert annotations["info"]["source_dois"] == [
+        public_data.ZENODO_DOI,
+        public_data.RGP_DOI,
+    ]
+    sources = {
+        source["id"]: source for source in annotations["blotgrid"]["sources"]
+    }
+    assert sources["gelgenie_v3"]["license_id"] == 1
+    assert sources["gelgenie_v3"]["doi"] == public_data.ZENODO_DOI
+    assert sources["gelgenie_v3"]["required_attribution"] == (
+        public_data.GELGENIE_CITATION
+    )
+    assert sources["rgp_caps"]["license_id"] == 2
+    assert sources["rgp_caps"]["doi"] == public_data.RGP_DOI
+    assert sources["rgp_caps"]["required_attribution"] == (
+        public_data.RGP_ATTRIBUTION
+    )
+    images = {
+        image["blotgrid"]["source_id"]: image for image in annotations["images"]
+    }
+    assert images["gelgenie_v3"]["blotgrid"]["source_doi"] == (
+        public_data.ZENODO_DOI
+    )
+    assert images["gelgenie_v3"]["blotgrid"]["required_attribution"] == (
+        public_data.GELGENIE_CITATION
+    )
+    assert images["rgp_caps"]["blotgrid"]["source_doi"] == public_data.RGP_DOI
+    assert images["rgp_caps"]["blotgrid"]["required_attribution"] == (
+        public_data.RGP_ATTRIBUTION
+    )

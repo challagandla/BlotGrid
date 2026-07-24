@@ -1,9 +1,70 @@
 # Third-party pretrained models
 
 BlotGrid does not commit model weights to this repository. The allowlisted
-installer downloads each artifact from its official host, pins an immutable
-revision, verifies the exact byte count and SHA-256, and writes a local metadata
-sidecar under the ignored `models/` directory.
+installer downloads GelGenie and SAM artifacts from their official hosts, pins
+immutable revisions, verifies exact byte counts and SHA-256 values, and writes
+local metadata sidecars under the ignored `models/` directory. Optional detector
+initializers are downloaded into TorchVision's cache by TorchVision itself;
+BlotGrid separately verifies their pinned full digest and size before training.
+
+## TorchVision detector initialization
+
+Optional detector training uses TorchVision `0.22.1` and pins concrete COCO v1
+weight enums rather than the mutable `DEFAULT` aliases:
+
+- `FasterRCNN_MobileNet_V3_Large_FPN_Weights.COCO_V1`:
+  `https://download.pytorch.org/models/fasterrcnn_mobilenet_v3_large_fpn-fb6a3cc7.pth`
+  - SHA-256: `fb6a3cc702b1df54c18a44b26708cd083614211062d0c36d2ca7bf9270df3533`
+  - Size: 77,844,807 bytes
+- `FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1`:
+  `https://download.pytorch.org/models/fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth`
+  - SHA-256: `dd69338a24b8d7381807e247652bdc356325bcbaf1cd3e092e00e0a1a58706bf`
+  - Size: 175,221,657 bytes
+- `FCOS_ResNet50_FPN_Weights.COCO_V1`:
+  `https://download.pytorch.org/models/fcos_resnet50_fpn_coco-99b0c9b7.pth`
+  - SHA-256: `99b0c9b7cfb1527d782db86b91d207f00547c792fb4103fc612b651d0a07b9e7`
+  - Size: 129,612,099 bytes
+- `RetinaNet_ResNet50_FPN_V2_Weights.COCO_V1`:
+  `https://download.pytorch.org/models/retinanet_resnet50_fpn_v2_coco-5905b1c5.pth`
+  - SHA-256: `5905b1c544219215e544dbe319720397bc4e68de61a733a59350d7976645b769`
+  - Size: 153,130,989 bytes
+
+Training records the installed TorchVision source revision, enum, URL, URL
+SHA-256 prefix, pinned full SHA-256 and byte size, and the exact cached artifact
+actually loaded. A correct eight-character filename prefix is not sufficient.
+TorchVision source code is BSD-3-Clause, but TorchVision states that pretrained
+models may have separate licences or terms inherited from their training
+datasets. BlotGrid therefore records these COCO initializers as
+`review_required`, not as cleared for checkpoint redistribution. Use
+`--no-pretrained` when a release candidate must avoid this transfer-weight
+lineage.
+
+Before publishing any locally trained checkpoint, run:
+
+```bash
+.venv/bin/python scripts/check_checkpoint_release.py models/detector.pt \
+  --release-output models/detector.release.pt \
+  --attribution-output models/detector.attribution.json
+```
+
+The local training archive is never published directly: PyTorch ZIP readers can
+ignore unreferenced members and trailing bytes. The command restricted-loads
+the checkpoint, requires its SHA-verified sidecar to match the embedded metadata
+exactly, strict-loads the declared model state, verifies exact tensor backing
+storage, and permits only the generated model/SGD fields. It then copies only
+those validated logical values into the distinct `--release-output` archive and
+re-verifies that artifact. The release output is written only if dataset
+sources and licences, public metadata, annotation approval, and initializer
+redistribution checks all pass. Local training remains available when
+publication clearance is incomplete.
+
+Checkpoint format 2 adds the public-safe dataset and initializer lineage
+contract. Publication metadata schema 2 additionally requires literal human
+approval markers on every band annotation; schema-1 release candidates must be
+retrained under that fail-closed policy. Format-1 checkpoints remain available
+for restricted-load inference, but cannot be resumed: their exact initializer
+and licence ancestry cannot be reconstructed safely. Start a new format-2
+training run instead.
 
 ## GelGenie Universal
 

@@ -277,16 +277,22 @@ def test_compare_groups_labels_match_groups():
 def test_project_round_trip_from_bytes():
     state = {"targets": ["Insig", "GAPDH"], "lanes": ["WT", "KO"],
              "control": "GAPDH", "bands_dark": True,
-             "alignment_applied": {"blot1.tif": -1.2},
+             "alignment_applied": {"blot1.tif": 0.0},
              "image_provenance": {"blot1.tif": {"sha256": "abc123"}},
+             "evaluation_task": {
+                 "schema_version": 1,
+                 "task_id": "task-opaque",
+                 "task_binding_sha256": "f" * 64,
+             },
              "layouts": {"blot1.tif": {"band_width": 40, "lane_x": [80, 180],
                                        "targets": {"Insig": {"y": 60, "h": 20}}}}}
     raw = project_io.project_json(state).encode("utf-8")
     back = project_io.load_project(raw)          # as uploaded bytes, not a path
     assert back["targets"] == ["Insig", "GAPDH"]
     assert back["layouts"]["blot1.tif"]["lane_x"] == [80, 180]
-    assert back["alignment_applied"]["blot1.tif"] == -1.2
+    assert back["alignment_applied"]["blot1.tif"] == 0.0
     assert back["image_provenance"]["blot1.tif"]["sha256"] == "abc123"
+    assert back["evaluation_task"]["task_id"] == "task-opaque"
     assert "_saved_at" in back
 
 
@@ -509,6 +515,19 @@ def test_roi_editor_server_guard_enforces_one_blot_size():
     assert roi_constraints.apply_editor_event(rois, shared_size, resize, 120, 100)
     assert shared_size == {"w": 34, "h": 16}
     assert {(roi["w"], roi["h"]) for roi in rois} == {(34, 16)}
+
+    frozen_rois = [dict(roi) for roi in rois]
+    frozen_size = dict(shared_size)
+    assert not roi_constraints.apply_editor_event(
+        rois,
+        shared_size,
+        resize,
+        120,
+        100,
+        allow_resize=False,
+    )
+    assert rois == frozen_rois
+    assert shared_size == frozen_size
     assert not any(roi["annotation_approved"] for roi in rois)
 
 

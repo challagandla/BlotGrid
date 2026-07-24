@@ -35,6 +35,7 @@ def edit_rois(
     display_width: int | None = None,
     viewport_height: int | None = None,
     selected_roi_id: str | None = None,
+    allow_resize: bool = True,
 ):
     """Render the interactive overlay and return an edit event, if any.
 
@@ -80,6 +81,7 @@ def edit_rois(
         display_width=int(display_width) if display_width else 0,
         viewport_height=int(viewport_height) if viewport_height else 0,
         selected_roi_id=str(selected_roi_id) if selected_roi_id else "",
+        allow_resize=bool(allow_resize),
         default=None,
         key=key,
         tab_index=0,

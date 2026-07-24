@@ -45,13 +45,16 @@ The GelGenie `lsdb_gels` archive contains derived masks but directs users to the
 original RGP caps database for the corresponding source images.
 
 - Dataset: *RGP: 332 PCR-based genetic markers on rice chromosomes*
-- DOI:
+- Database DOI:
   [doi:10.18908/lsdba.nbdc00318-05-000](https://doi.org/10.18908/lsdba.nbdc00318-05-000)
+- Electrophoresis-image collection DOI:
+  [doi:10.18908/lsdba.nbdc00318-05-002](https://doi.org/10.18908/lsdba.nbdc00318-05-002)
 - Provider: National Institute of Agrobiological Sciences / LSDB Archive
 - License: Creative Commons Attribution-ShareAlike 2.1 Japan
 - Required attribution: “RGP: 332 PCR-based genetic markers on rice
   chromosomes © National Institute of Agrobiological Sciences licensed under
-  CC Attribution-Share Alike 2.1 Japan”
+  CC Attribution-Share Alike 2.1 Japan;
+  doi:10.18908/lsdba.nbdc00318-05-002”
 
 The preparation script pins and SHA-256 verifies the archive used for this
 training run. Any redistributed derivative based on the RGP data remains

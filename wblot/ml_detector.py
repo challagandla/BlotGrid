@@ -13,7 +13,9 @@ import math
 import os
 from pathlib import Path
 import stat
+import tempfile
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -34,9 +36,103 @@ SUPPORTED_ARCHITECTURES = (
     "fcos_resnet50_fpn",
     "retinanet_resnet50_fpn_v2",
 )
-CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FORMAT_VERSION = 2
 _MAX_CHECKPOINT_BYTES = 8 * 1024**3
-_MAX_METADATA_BYTES = 1024**2
+MAX_CHECKPOINT_METADATA_BYTES = 1024**2
+_MAX_METADATA_BYTES = MAX_CHECKPOINT_METADATA_BYTES
+
+_TORCHVISION_WEIGHT_SPECS: dict[str, dict[str, str | int]] = {
+    "fasterrcnn_mobilenet_v3_large_fpn": {
+        "enum_class": "FasterRCNN_MobileNet_V3_Large_FPN_Weights",
+        "enum_member": "COCO_V1",
+        "url": (
+            "https://download.pytorch.org/models/"
+            "fasterrcnn_mobilenet_v3_large_fpn-fb6a3cc7.pth"
+        ),
+        "sha256_prefix": "fb6a3cc7",
+        "sha256": (
+            "fb6a3cc702b1df54c18a44b26708cd083614211062d0c36d2ca7bf9270df3533"
+        ),
+        "size_bytes": 77844807,
+        "recipe_url": (
+            "https://github.com/pytorch/vision/tree/main/references/"
+            "detection#faster-r-cnn-mobilenetv3-large-fpn"
+        ),
+    },
+    "fasterrcnn_resnet50_fpn_v2": {
+        "enum_class": "FasterRCNN_ResNet50_FPN_V2_Weights",
+        "enum_member": "COCO_V1",
+        "url": (
+            "https://download.pytorch.org/models/"
+            "fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth"
+        ),
+        "sha256_prefix": "dd69338a",
+        "sha256": (
+            "dd69338a24b8d7381807e247652bdc356325bcbaf1cd3e092e00e0a1a58706bf"
+        ),
+        "size_bytes": 175221657,
+        "recipe_url": "https://github.com/pytorch/vision/pull/5763",
+    },
+    "fcos_resnet50_fpn": {
+        "enum_class": "FCOS_ResNet50_FPN_Weights",
+        "enum_member": "COCO_V1",
+        "url": (
+            "https://download.pytorch.org/models/"
+            "fcos_resnet50_fpn_coco-99b0c9b7.pth"
+        ),
+        "sha256_prefix": "99b0c9b7",
+        "sha256": (
+            "99b0c9b7cfb1527d782db86b91d207f00547c792fb4103fc612b651d0a07b9e7"
+        ),
+        "size_bytes": 129612099,
+        "recipe_url": (
+            "https://github.com/pytorch/vision/tree/main/references/"
+            "detection#fcos-resnet-50-fpn"
+        ),
+    },
+    "retinanet_resnet50_fpn_v2": {
+        "enum_class": "RetinaNet_ResNet50_FPN_V2_Weights",
+        "enum_member": "COCO_V1",
+        "url": (
+            "https://download.pytorch.org/models/"
+            "retinanet_resnet50_fpn_v2_coco-5905b1c5.pth"
+        ),
+        "sha256_prefix": "5905b1c5",
+        "sha256": (
+            "5905b1c544219215e544dbe319720397bc4e68de61a733a59350d7976645b769"
+        ),
+        "size_bytes": 153130989,
+        "recipe_url": "https://github.com/pytorch/vision/pull/5756",
+    },
+}
+
+_TORCHVISION_WEIGHT_LICENSE_ASSESSMENT = {
+    "status": "review_required",
+    "redistribution_cleared": False,
+    "torchvision_code_license": "BSD-3-Clause",
+    "pretrained_weight_license": "not_stated_by_torchvision",
+    "training_dataset": "COCO",
+    "assessment": (
+        "TorchVision states that pretrained models may have licences or terms "
+        "derived from their training datasets. Do not treat the TorchVision "
+        "source-code licence as clearance to redistribute a derived checkpoint."
+    ),
+    "evidence_url": "https://github.com/pytorch/vision#using-the-pre-trained-models",
+}
+
+_SCRATCH_INITIALIZATION_SCOPE = "all detector parameters initialized locally"
+_SCRATCH_LICENSE_ASSESSMENT = {
+    "status": "not_applicable",
+    "redistribution_cleared": None,
+    "reason": (
+        "No third-party pretrained weights were loaded. Dataset lineage must "
+        "still be assessed separately."
+    ),
+}
+_PRETRAINED_INITIALIZATION_SCOPE = (
+    "TorchVision detector weights loaded; BlotGrid replaces the COCO "
+    "classification logits with a two-class background/band head."
+)
 
 
 class MLDetectorError(ValueError):
@@ -106,12 +202,310 @@ def _safe_metadata(value: Any, *, depth: int = 0) -> Any:
     return None
 
 
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    """Build a JSON object only when every key occurs exactly once."""
+    parsed: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        parsed[key] = value
+    return parsed
+
+
+def _loads_unique_json(text: str) -> Any:
+    return json.loads(text, object_pairs_hook=_reject_duplicate_json_object)
+
+
 def _sha256_file(path: Path, *, chunk_size: int = 1024**2) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _torchvision_source_revision(torchvision: Any) -> str:
+    version_module = getattr(torchvision, "version", None)
+    return str(getattr(version_module, "git_version", "") or "").strip()
+
+
+def _resolve_torchvision_weights(
+    torchvision: Any,
+    architecture: str,
+    *,
+    pretrained: bool,
+) -> Any:
+    if architecture not in _TORCHVISION_WEIGHT_SPECS:
+        supported = ", ".join(SUPPORTED_ARCHITECTURES)
+        raise MLDetectorError(
+            f"Unsupported detector architecture {architecture!r}. "
+            f"Supported architectures: {supported}."
+        )
+    if not pretrained:
+        return None
+    spec = _TORCHVISION_WEIGHT_SPECS[architecture]
+    detection_models = torchvision.models.detection
+    try:
+        enum_class = getattr(detection_models, spec["enum_class"])
+        weights = getattr(enum_class, spec["enum_member"])
+    except AttributeError as exc:
+        raise MLDetectorError(
+            "The installed TorchVision runtime does not expose the pinned "
+            f"{spec['enum_class']}.{spec['enum_member']} initialization."
+        ) from exc
+    if str(getattr(weights, "url", "")) != spec["url"]:
+        raise MLDetectorError(
+            "TorchVision's pretrained-weight URL differs from BlotGrid's pinned "
+            f"provenance contract for {architecture}."
+        )
+    return weights
+
+
+def _torchvision_cached_artifact(torch: Any, weights: Any) -> Path:
+    filename = Path(urlparse(str(weights.url)).path).name
+    if not filename:
+        raise MLDetectorError("TorchVision's pretrained-weight URL has no filename.")
+    candidate = Path(torch.hub.get_dir()) / "checkpoints" / filename
+    if candidate.is_symlink() or not candidate.is_file():
+        raise MLDetectorError(
+            "TorchVision initialized the detector but the exact cached weight "
+            "artifact could not be verified."
+        )
+    return candidate
+
+
+def torchvision_initialization_provenance(
+    architecture: str,
+    *,
+    pretrained: bool,
+    torchvision: Any,
+    artifact_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Return a bounded, exact initialization record without downloading weights."""
+    weights = _resolve_torchvision_weights(
+        torchvision,
+        architecture,
+        pretrained=bool(pretrained),
+    )
+    runtime_version = str(getattr(torchvision, "__version__", "") or "").strip()
+    runtime_revision = _torchvision_source_revision(torchvision)
+    if not pretrained:
+        return {
+            "schema_version": 1,
+            "mode": "random_initialization",
+            "architecture": architecture,
+            "weights_enum": None,
+            "weights_revision": None,
+            "weights_url": None,
+            "url_sha256_prefix": None,
+            "expected_artifact_sha256": None,
+            "expected_artifact_size_bytes": None,
+            "artifact_sha256": None,
+            "artifact_size_bytes": None,
+            "artifact_verified": None,
+            "torchvision_version": runtime_version or None,
+            "torchvision_git_revision": runtime_revision or None,
+            "initialization_scope": _SCRATCH_INITIALIZATION_SCOPE,
+            "license_assessment": dict(_SCRATCH_LICENSE_ASSESSMENT),
+        }
+
+    if not runtime_version or not runtime_revision:
+        raise MLDetectorError(
+            "Exact TorchVision version and source revision are required when "
+            "pretrained initialization is enabled."
+        )
+    spec = _TORCHVISION_WEIGHT_SPECS[architecture]
+    enum_name = f"{spec['enum_class']}.{spec['enum_member']}"
+    artifact_sha256 = None
+    artifact_size = None
+    artifact_verified = False
+    if artifact_path is not None:
+        artifact = Path(artifact_path)
+        if artifact.is_symlink() or not artifact.is_file():
+            raise MLDetectorError(
+                "The TorchVision initialization artifact must be a regular file."
+            )
+        artifact_sha256 = _sha256_file(artifact)
+        artifact_size = int(artifact.stat().st_size)
+        if (
+            artifact_sha256 != spec["sha256"]
+            or artifact_size != spec["size_bytes"]
+        ):
+            raise MLDetectorError(
+                "The cached TorchVision initialization artifact does not match "
+                "BlotGrid's pinned full SHA-256 and byte size for "
+                f"{architecture}."
+            )
+        artifact_verified = True
+    recipe = getattr(weights, "meta", {}).get("recipe")
+    return {
+        "schema_version": 1,
+        "mode": "torchvision_pretrained",
+        "architecture": architecture,
+        "weights_enum": enum_name,
+        "weights_revision": spec["enum_member"],
+        "weights_url": spec["url"],
+        "url_sha256_prefix": spec["sha256_prefix"],
+        "expected_artifact_sha256": spec["sha256"],
+        "expected_artifact_size_bytes": spec["size_bytes"],
+        "artifact_sha256": artifact_sha256,
+        "artifact_size_bytes": artifact_size,
+        "artifact_verified": artifact_verified,
+        "torchvision_version": runtime_version,
+        "torchvision_git_revision": runtime_revision,
+        "recipe_url": str(recipe) if recipe else None,
+        "training_dataset": "COCO",
+        "initialization_scope": _PRETRAINED_INITIALIZATION_SCOPE,
+        "license_assessment": dict(_TORCHVISION_WEIGHT_LICENSE_ASSESSMENT),
+    }
+
+
+def validate_initialization_provenance(
+    record: Any,
+    architecture: str,
+    *,
+    torchvision_version: str,
+    torchvision_git_revision: str,
+    require_verified_artifact: bool = True,
+) -> dict[str, Any]:
+    """Validate a checkpoint initializer against the current pinned contract."""
+    if architecture not in _TORCHVISION_WEIGHT_SPECS:
+        raise MLDetectorError(
+            f"Unsupported detector architecture {architecture!r}."
+        )
+    if not isinstance(record, dict):
+        raise MLDetectorError("Initialization provenance must be an object.")
+    copied = _safe_metadata(record)
+    if (
+        copied != record
+        or type(copied.get("schema_version")) is not int
+        or copied.get("schema_version") != 1
+    ):
+        raise MLDetectorError("Initialization provenance is not safe schema 1.")
+    pretrained_fields = {
+        "schema_version",
+        "mode",
+        "architecture",
+        "weights_enum",
+        "weights_revision",
+        "weights_url",
+        "url_sha256_prefix",
+        "expected_artifact_sha256",
+        "expected_artifact_size_bytes",
+        "artifact_sha256",
+        "artifact_size_bytes",
+        "artifact_verified",
+        "torchvision_version",
+        "torchvision_git_revision",
+        "recipe_url",
+        "training_dataset",
+        "initialization_scope",
+        "license_assessment",
+    }
+    scratch_fields = pretrained_fields - {"recipe_url", "training_dataset"}
+    mode = copied.get("mode")
+    expected_fields = (
+        scratch_fields
+        if mode == "random_initialization"
+        else pretrained_fields
+        if mode == "torchvision_pretrained"
+        else set()
+    )
+    if set(copied) != expected_fields:
+        raise MLDetectorError(
+            "Initialization provenance fields do not exactly match its mode."
+        )
+    if mode not in {"random_initialization", "torchvision_pretrained"}:
+        raise MLDetectorError("Initialization provenance mode is invalid.")
+    if copied.get("architecture") != architecture:
+        raise MLDetectorError(
+            "Initialization provenance architecture does not match the model."
+        )
+    if copied.get("torchvision_version") != (torchvision_version or None):
+        raise MLDetectorError(
+            "Initialization provenance TorchVision version changed."
+        )
+    if copied.get("torchvision_git_revision") != (
+        torchvision_git_revision or None
+    ):
+        raise MLDetectorError(
+            "Initialization provenance TorchVision source revision changed."
+        )
+
+    weight_fields = (
+        "weights_enum",
+        "weights_revision",
+        "weights_url",
+        "url_sha256_prefix",
+        "expected_artifact_sha256",
+        "expected_artifact_size_bytes",
+        "artifact_sha256",
+        "artifact_size_bytes",
+    )
+    assessment = copied.get("license_assessment")
+    if mode == "random_initialization":
+        if any(copied.get(field) is not None for field in weight_fields):
+            raise MLDetectorError(
+                "Scratch initialization must not claim third-party weights."
+            )
+        if copied.get("artifact_verified") is not None:
+            raise MLDetectorError(
+                "Scratch initialization cannot claim artifact verification."
+            )
+        if (
+            copied.get("initialization_scope")
+            != _SCRATCH_INITIALIZATION_SCOPE
+            or assessment != _SCRATCH_LICENSE_ASSESSMENT
+        ):
+            raise MLDetectorError(
+                "Scratch initialization provenance is not the generated record."
+            )
+        return copied
+
+    spec = _TORCHVISION_WEIGHT_SPECS[architecture]
+    expected = {
+        "weights_enum": f"{spec['enum_class']}.{spec['enum_member']}",
+        "weights_revision": spec["enum_member"],
+        "weights_url": spec["url"],
+        "url_sha256_prefix": spec["sha256_prefix"],
+        "expected_artifact_sha256": spec["sha256"],
+        "expected_artifact_size_bytes": spec["size_bytes"],
+        "recipe_url": spec["recipe_url"],
+        "training_dataset": "COCO",
+        "initialization_scope": _PRETRAINED_INITIALIZATION_SCOPE,
+    }
+    for field, value in expected.items():
+        if copied.get(field) != value:
+            raise MLDetectorError(
+                f"Initialization provenance field {field!r} is not pinned."
+            )
+    artifact_hash = copied.get("artifact_sha256")
+    artifact_size = copied.get("artifact_size_bytes")
+    artifact_verified = copied.get("artifact_verified")
+    artifact_matches = (
+        artifact_hash == spec["sha256"]
+        and artifact_size == spec["size_bytes"]
+        and artifact_verified is True
+    )
+    artifact_absent = (
+        artifact_hash is None
+        and artifact_size is None
+        and artifact_verified is False
+    )
+    if (require_verified_artifact and not artifact_matches) or (
+        not require_verified_artifact
+        and not (artifact_matches or artifact_absent)
+    ):
+        raise MLDetectorError(
+            "Initialization provenance lacks the verified pinned weight artifact."
+        )
+    if assessment != _TORCHVISION_WEIGHT_LICENSE_ASSESSMENT:
+        raise MLDetectorError(
+            "TorchVision initializer licence assessment is not conservative."
+        )
+    return copied
 
 
 def checkpoint_provenance(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -133,7 +527,7 @@ def checkpoint_provenance(path: str | os.PathLike[str]) -> dict[str, Any]:
                 raise ValueError("metadata sidecar is not a regular file")
             if sidecar.stat().st_size > _MAX_METADATA_BYTES:
                 raise ValueError("metadata sidecar exceeds 1 MiB")
-            parsed = json.loads(sidecar.read_text(encoding="utf-8"))
+            parsed = _loads_unique_json(sidecar.read_text(encoding="utf-8"))
             if not isinstance(parsed, dict):
                 raise ValueError("metadata sidecar must contain a JSON object")
             metadata = _safe_metadata(parsed)
@@ -181,6 +575,7 @@ def _build_model(
     pretrained: bool = False,
     trainable_backbone_layers: int | None = None,
     freeze_backbone_batch_norm: bool = False,
+    return_initialization_provenance: bool = False,
 ):
     """Build a two-class TorchVision detector (background + band)."""
     torch, torchvision = _require_ml_runtime()
@@ -195,12 +590,12 @@ def _build_model(
         detection_models = torchvision.models.detection
         from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
+        weights = _resolve_torchvision_weights(
+            torchvision,
+            architecture,
+            pretrained=bool(pretrained),
+        )
         if architecture == DEFAULT_ARCHITECTURE:
-            weights = (
-                detection_models.FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
-                if pretrained
-                else None
-            )
             model = detection_models.fasterrcnn_mobilenet_v3_large_fpn(
                 weights=weights,
                 weights_backbone=None,
@@ -208,11 +603,6 @@ def _build_model(
             in_features = model.roi_heads.box_predictor.cls_score.in_features
             model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 2)
         elif architecture == "fasterrcnn_resnet50_fpn_v2":
-            weights = (
-                detection_models.FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
-                if pretrained
-                else None
-            )
             model = detection_models.fasterrcnn_resnet50_fpn_v2(
                 weights=weights,
                 weights_backbone=None,
@@ -221,21 +611,11 @@ def _build_model(
             model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 2)
         else:
             if architecture == "fcos_resnet50_fpn":
-                weights = (
-                    detection_models.FCOS_ResNet50_FPN_Weights.DEFAULT
-                    if pretrained
-                    else None
-                )
                 model = detection_models.fcos_resnet50_fpn(
                     weights=weights,
                     weights_backbone=None,
                 )
             else:
-                weights = (
-                    detection_models.RetinaNet_ResNet50_FPN_V2_Weights.DEFAULT
-                    if pretrained
-                    else None
-                )
                 model = detection_models.retinanet_resnet50_fpn_v2(
                     weights=weights,
                     weights_backbone=None,
@@ -270,6 +650,15 @@ def _build_model(
                 architecture,
                 int(trainable_backbone_layers),
             )
+        artifact_path = (
+            _torchvision_cached_artifact(torch, weights) if pretrained else None
+        )
+        initialization_provenance = torchvision_initialization_provenance(
+            architecture,
+            pretrained=bool(pretrained),
+            torchvision=torchvision,
+            artifact_path=artifact_path,
+        )
     except MLDetectorError:
         raise
     except Exception as exc:
@@ -282,6 +671,8 @@ def _build_model(
         raise MLDetectorError(
             f"Could not build the {architecture} detector.{download_hint}"
         ) from exc
+    if return_initialization_provenance:
+        return model, initialization_provenance
     return model
 
 
@@ -374,6 +765,23 @@ def build_model(
     )
 
 
+def build_model_with_provenance(
+    architecture: str = DEFAULT_ARCHITECTURE,
+    *,
+    pretrained: bool = False,
+    trainable_backbone_layers: int | None = None,
+    freeze_backbone_batch_norm: bool = False,
+):
+    """Build a detector and return the exact initialization provenance."""
+    return _build_model(
+        architecture,
+        pretrained=pretrained,
+        trainable_backbone_layers=trainable_backbone_layers,
+        freeze_backbone_batch_norm=freeze_backbone_batch_norm,
+        return_initialization_provenance=True,
+    )
+
+
 def _extract_checkpoint_payload(payload: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(payload, dict):
         raise MLDetectorError("Checkpoint must contain a dictionary of model weights.")
@@ -420,6 +828,538 @@ def _load_checkpoint(
         ) from exc
     state_dict, metadata = _extract_checkpoint_payload(payload)
     return state_dict, metadata, payload
+
+
+def _canonical_metadata_bytes(value: dict[str, Any]) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise MLDetectorError(
+            "Checkpoint metadata is not canonical JSON."
+        ) from exc
+
+
+def _strict_container_model(
+    state_dict: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    torch: Any,
+) -> Any:
+    """Build the declared detector and strictly bind every model-state key."""
+    if any(not isinstance(key, str) for key in state_dict):
+        raise MLDetectorError("Checkpoint model-state keys must be strings.")
+    for key, tensor in state_dict.items():
+        _verify_exact_tensor_storage(
+            tensor,
+            torch=torch,
+            field=f"model state {key!r}",
+        )
+    architecture = metadata.get("architecture")
+    if not isinstance(architecture, str) or architecture not in SUPPORTED_ARCHITECTURES:
+        raise MLDetectorError(
+            "Checkpoint container does not declare a supported architecture."
+        )
+    trainable_layers = metadata.get("trainable_backbone_layers")
+    if trainable_layers is not None and (
+        isinstance(trainable_layers, bool) or not isinstance(trainable_layers, int)
+    ):
+        raise MLDetectorError(
+            "Checkpoint trainable_backbone_layers must be an integer."
+        )
+    pretrained_transfer = metadata.get("pretrained_transfer_learning", False)
+    if not isinstance(pretrained_transfer, bool):
+        raise MLDetectorError(
+            "Checkpoint pretrained_transfer_learning must be boolean."
+        )
+    model = _build_model(
+        architecture,
+        pretrained=False,
+        trainable_backbone_layers=trainable_layers,
+        freeze_backbone_batch_norm=pretrained_transfer,
+    )
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except Exception as exc:
+        raise MLDetectorError(
+            "Checkpoint model state does not exactly match the declared "
+            "detector architecture."
+        ) from exc
+    return model
+
+
+def _verify_exact_tensor_storage(
+    tensor: Any,
+    *,
+    torch: Any,
+    field: str,
+) -> None:
+    """Reject tensor views or storage slack that could conceal unrelated bytes."""
+    if (
+        type(tensor) is not torch.Tensor
+        or tensor.layout != torch.strided
+        or tensor.device.type != "cpu"
+        or tensor.requires_grad
+        or tensor.is_quantized
+        or getattr(tensor, "is_nested", False)
+        or not tensor.is_contiguous()
+        or tensor.storage_offset() != 0
+        or tensor.is_conj()
+        or tensor.is_neg()
+    ):
+        raise MLDetectorError(
+            f"Checkpoint {field} is not a plain contiguous CPU tensor."
+        )
+    expected_bytes = tensor.numel() * tensor.element_size()
+    try:
+        storage_bytes = tensor.untyped_storage().nbytes()
+    except (AttributeError, RuntimeError) as exc:
+        raise MLDetectorError(
+            f"Checkpoint {field} backing storage could not be verified."
+        ) from exc
+    if storage_bytes != expected_bytes:
+        raise MLDetectorError(
+            f"Checkpoint {field} backing storage contains bytes outside its "
+            "declared tensor."
+        )
+
+
+def _finite_optimizer_number(
+    value: Any,
+    *,
+    field: str,
+    positive: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MLDetectorError(
+            f"Checkpoint optimizer {field} must be a finite number."
+        )
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0 or (positive and number == 0.0):
+        qualifier = "positive" if positive else "non-negative"
+        raise MLDetectorError(
+            f"Checkpoint optimizer {field} must be finite and {qualifier}."
+        )
+    return number
+
+
+def _verify_sgd_optimizer_state(
+    optimizer_state: Any,
+    *,
+    metadata: dict[str, Any],
+    model: Any,
+    torch: Any,
+) -> None:
+    """Constrain optimizer payload to the exact generated one-group SGD schema."""
+    if not isinstance(optimizer_state, dict) or set(optimizer_state) != {
+        "state",
+        "param_groups",
+    }:
+        raise MLDetectorError(
+            "Checkpoint optimizer state must contain exactly state and param_groups."
+        )
+    training_config = metadata.get("training_config")
+    if not isinstance(training_config, dict) or training_config.get("optimizer") != "SGD":
+        raise MLDetectorError(
+            "Checkpoint optimizer state is only accepted for declared SGD training."
+        )
+    learning_rate = _finite_optimizer_number(
+        training_config.get("learning_rate"),
+        field="learning_rate",
+        positive=True,
+    )
+    momentum = _finite_optimizer_number(
+        training_config.get("momentum"),
+        field="momentum",
+    )
+    weight_decay = _finite_optimizer_number(
+        training_config.get("weight_decay"),
+        field="weight_decay",
+    )
+    trainable_layers = metadata.get("trainable_backbone_layers")
+    configured_layers = training_config.get("trainable_backbone_layers")
+    if (
+        isinstance(configured_layers, bool)
+        or not isinstance(configured_layers, int)
+        or configured_layers != trainable_layers
+    ):
+        raise MLDetectorError(
+            "Checkpoint optimizer trainable-backbone declaration is inconsistent."
+        )
+
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not parameters:
+        raise MLDetectorError(
+            "Checkpoint optimizer has no declared trainable parameters."
+        )
+    reference_optimizer = torch.optim.SGD(
+        parameters,
+        lr=learning_rate,
+        momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    reference_group = reference_optimizer.state_dict()["param_groups"][0]
+    parameter_groups = optimizer_state["param_groups"]
+    if (
+        not isinstance(parameter_groups, list)
+        or len(parameter_groups) != 1
+        or not isinstance(parameter_groups[0], dict)
+    ):
+        raise MLDetectorError(
+            "Checkpoint optimizer must contain exactly one parameter group."
+        )
+    group = parameter_groups[0]
+    if set(group) != set(reference_group):
+        raise MLDetectorError(
+            "Checkpoint optimizer parameter group contains unsupported fields."
+        )
+    expected_parameter_ids = reference_group["params"]
+    if group.get("params") != expected_parameter_ids:
+        raise MLDetectorError(
+            "Checkpoint optimizer parameter IDs do not match the declared model."
+        )
+    for field, expected in reference_group.items():
+        if field == "params":
+            continue
+        actual = group[field]
+        if type(actual) is not type(expected) or actual != expected:
+            raise MLDetectorError(
+                f"Checkpoint optimizer parameter group {field!r} differs "
+                "from the declared training configuration."
+            )
+
+    state = optimizer_state["state"]
+    if not isinstance(state, dict):
+        raise MLDetectorError("Checkpoint optimizer state entries must be an object.")
+    expected_ids = set(expected_parameter_ids)
+    if any(type(parameter_id) is not int for parameter_id in state) or not set(
+        state
+    ).issubset(expected_ids):
+        raise MLDetectorError(
+            "Checkpoint optimizer state contains an unknown parameter ID."
+        )
+    if momentum == 0.0 and state:
+        raise MLDetectorError(
+            "Checkpoint optimizer cannot contain momentum buffers when momentum is zero."
+        )
+    parameters_by_id = dict(zip(expected_parameter_ids, parameters))
+    for parameter_id, parameter_state in state.items():
+        if not isinstance(parameter_state, dict) or set(parameter_state) != {
+            "momentum_buffer"
+        }:
+            raise MLDetectorError(
+                "Checkpoint SGD state entries may contain only momentum_buffer."
+            )
+        buffer = parameter_state["momentum_buffer"]
+        parameter = parameters_by_id[parameter_id]
+        _verify_exact_tensor_storage(
+            buffer,
+            torch=torch,
+            field=f"optimizer momentum buffer {parameter_id}",
+        )
+        if (
+            buffer.dtype != parameter.dtype
+            or tuple(buffer.shape) != tuple(parameter.shape)
+        ):
+            raise MLDetectorError(
+                "Checkpoint SGD momentum buffer does not match its model parameter."
+            )
+
+
+def _verify_generated_checkpoint_container(
+    payload: dict[str, Any],
+    *,
+    state_dict: dict[str, Any],
+    metadata: dict[str, Any],
+    torch: Any,
+) -> int:
+    """Verify the exact data-bearing contract written by format-2 training."""
+    if (
+        type(payload.get("format_version")) is not int
+        or payload.get("format_version") != CHECKPOINT_FORMAT_VERSION
+    ):
+        raise MLDetectorError(
+            f"Checkpoint container must use format {CHECKPOINT_FORMAT_VERSION}."
+        )
+    if (
+        type(metadata.get("format_version")) is not int
+        or metadata.get("format_version") != CHECKPOINT_FORMAT_VERSION
+    ):
+        raise MLDetectorError(
+            f"Embedded checkpoint metadata must use format {CHECKPOINT_FORMAT_VERSION}."
+        )
+    if type(metadata.get("publication_metadata_schema_version")) is not int:
+        raise MLDetectorError(
+            "Checkpoint publication metadata schema must be a literal integer."
+        )
+    optimizer_included = metadata.get("optimizer_state_included")
+    if not isinstance(optimizer_included, bool):
+        raise MLDetectorError(
+            "Checkpoint optimizer_state_included metadata must be boolean."
+        )
+    expected_keys = {"format_version", "state_dict", "metadata"}
+    if optimizer_included:
+        expected_keys.add("optimizer_state_dict")
+    if set(payload) != expected_keys:
+        raise MLDetectorError(
+            "Checkpoint container top-level fields do not exactly match the "
+            "generated format-2 schema."
+        )
+
+    model = _strict_container_model(state_dict, metadata, torch=torch)
+    trainable_parameter_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    if (
+        type(metadata.get("trainable_parameter_count")) is not int
+        or metadata.get("trainable_parameter_count")
+        != trainable_parameter_count
+        or trainable_parameter_count <= 0
+    ):
+        raise MLDetectorError(
+            "Checkpoint trainable_parameter_count does not match the strict "
+            "declared model."
+        )
+    if optimizer_included:
+        _verify_sgd_optimizer_state(
+            payload["optimizer_state_dict"],
+            metadata=metadata,
+            model=model,
+            torch=torch,
+        )
+    return trainable_parameter_count
+
+
+def verified_checkpoint_provenance(
+    path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Verify sidecar claims against metadata inside a restricted-load checkpoint."""
+    provenance = checkpoint_provenance(path)
+    provenance["embedded_metadata_verified"] = False
+    provenance["container_verified"] = False
+    provenance["verified_trainable_parameter_count"] = None
+    provenance["release_artifact_sanitized"] = False
+    if provenance.get("metadata_verified") is not True:
+        return provenance
+
+    torch, _ = _require_ml_runtime()
+    state_dict, embedded_metadata, payload = _load_checkpoint(
+        path,
+        device=torch.device("cpu"),
+    )
+    raw_embedded_metadata = payload.get("metadata")
+    if not isinstance(raw_embedded_metadata, dict):
+        raise MLDetectorError(
+            "Restricted-load checkpoint metadata must be an object."
+        )
+
+    checkpoint = _safe_checkpoint_path(path)
+    sidecar = _metadata_sidecar(checkpoint)
+    try:
+        raw_sidecar_metadata = _loads_unique_json(
+            sidecar.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise MLDetectorError(
+            "Checkpoint sidecar could not be re-read for exact comparison."
+        ) from exc
+    if not isinstance(raw_sidecar_metadata, dict):
+        raise MLDetectorError(
+            "Verified checkpoint sidecar metadata must be an object."
+        )
+    if raw_sidecar_metadata.get("checkpoint_sha256") != provenance["sha256"]:
+        raise MLDetectorError(
+            "Checkpoint sidecar SHA-256 changed during embedded verification."
+        )
+    raw_sidecar_metadata.pop("checkpoint_sha256", None)
+    exposed_sidecar_metadata = dict(provenance["metadata"])
+    exposed_sidecar_metadata.pop("checkpoint_sha256", None)
+    if (
+        _canonical_metadata_bytes(raw_sidecar_metadata)
+        != _canonical_metadata_bytes(exposed_sidecar_metadata)
+        or _canonical_metadata_bytes(raw_embedded_metadata)
+        != _canonical_metadata_bytes(embedded_metadata)
+    ):
+        raise MLDetectorError(
+            "Checkpoint metadata exceeds the safe exact-comparison contract."
+        )
+    if _canonical_metadata_bytes(
+        raw_sidecar_metadata
+    ) != _canonical_metadata_bytes(raw_embedded_metadata):
+        raise MLDetectorError(
+            "Checkpoint sidecar metadata does not exactly match the metadata "
+            "embedded in the restricted-load checkpoint."
+        )
+    if payload.get("format_version") != embedded_metadata.get("format_version"):
+        raise MLDetectorError(
+            "Checkpoint container and embedded metadata format versions differ."
+        )
+    trainable_parameter_count = _verify_generated_checkpoint_container(
+        payload,
+        state_dict=state_dict,
+        metadata=embedded_metadata,
+        torch=torch,
+    )
+    if _sha256_file(checkpoint) != provenance["sha256"]:
+        raise MLDetectorError(
+            "Checkpoint changed during embedded metadata verification."
+        )
+    provenance["embedded_metadata_verified"] = True
+    provenance["container_verified"] = True
+    provenance[
+        "verified_trainable_parameter_count"
+    ] = trainable_parameter_count
+    return provenance
+
+
+def _clone_sanitized_optimizer_state(
+    optimizer_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy only the already-validated generated SGD primitives and tensors."""
+    sanitized_state: dict[int, dict[str, Any]] = {}
+    for parameter_id, parameter_state in optimizer_state["state"].items():
+        buffer = parameter_state["momentum_buffer"]
+        sanitized_state[int(parameter_id)] = {
+            "momentum_buffer": buffer.detach().cpu().contiguous().clone()
+        }
+    sanitized_groups: list[dict[str, Any]] = []
+    for group in optimizer_state["param_groups"]:
+        sanitized_group: dict[str, Any] = {}
+        for key, value in group.items():
+            if key == "params":
+                sanitized_group[key] = [int(item) for item in value]
+            elif value is None or type(value) in {bool, int, float, str}:
+                sanitized_group[key] = value
+            else:
+                raise MLDetectorError(
+                    "Validated SGD state contained a non-primitive group value."
+                )
+        sanitized_groups.append(sanitized_group)
+    return {"state": sanitized_state, "param_groups": sanitized_groups}
+
+
+def sanitize_checkpoint_for_release(
+    source: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Write and verify a distinct release artifact with freshly owned tensors.
+
+    The source archive is never certified for redistribution: PyTorch ZIP
+    readers tolerate unreferenced members and trailing bytes. This function
+    restricted-loads and validates the source, copies only declared logical
+    values into new storage, writes a fresh archive and sidecar, and returns
+    provenance for that newly generated artifact.
+    """
+    source_path = _safe_checkpoint_path(source)
+    destination_path = Path(destination).expanduser().resolve()
+    destination_sidecar = _metadata_sidecar(destination_path)
+    if destination_path == source_path:
+        raise MLDetectorError(
+            "Release output must be distinct from the local training checkpoint."
+        )
+    if (
+        destination_path.exists()
+        or destination_path.is_symlink()
+        or destination_sidecar.exists()
+        or destination_sidecar.is_symlink()
+    ):
+        raise MLDetectorError(
+            "Release output and sidecar must not already exist."
+        )
+
+    source_provenance = verified_checkpoint_provenance(source_path)
+    if (
+        source_provenance.get("embedded_metadata_verified") is not True
+        or source_provenance.get("container_verified") is not True
+    ):
+        raise MLDetectorError(
+            "Source checkpoint did not pass restricted container verification."
+        )
+    torch, _ = _require_ml_runtime()
+    state_dict, metadata, payload = _load_checkpoint(
+        source_path,
+        device=torch.device("cpu"),
+    )
+    _verify_generated_checkpoint_container(
+        payload,
+        state_dict=state_dict,
+        metadata=metadata,
+        torch=torch,
+    )
+    sanitized_payload: dict[str, Any] = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "state_dict": {
+            key: tensor.detach().cpu().contiguous().clone()
+            for key, tensor in state_dict.items()
+        },
+        "metadata": dict(metadata),
+    }
+    if metadata["optimizer_state_included"]:
+        sanitized_payload[
+            "optimizer_state_dict"
+        ] = _clone_sanitized_optimizer_state(
+            payload["optimizer_state_dict"]
+        )
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_descriptor, checkpoint_temporary_name = tempfile.mkstemp(
+        prefix=destination_path.name + ".",
+        suffix=".tmp",
+        dir=destination_path.parent,
+    )
+    os.close(checkpoint_descriptor)
+    checkpoint_temporary = Path(checkpoint_temporary_name)
+    sidecar_descriptor, sidecar_temporary_name = tempfile.mkstemp(
+        prefix=destination_sidecar.name + ".",
+        suffix=".tmp",
+        dir=destination_path.parent,
+    )
+    os.close(sidecar_descriptor)
+    sidecar_temporary = Path(sidecar_temporary_name)
+    moved_checkpoint = False
+    try:
+        torch.save(sanitized_payload, checkpoint_temporary)
+        release_sidecar = {
+            **metadata,
+            "checkpoint_sha256": _sha256_file(checkpoint_temporary),
+        }
+        with sidecar_temporary.open("w", encoding="utf-8") as handle:
+            json.dump(
+                release_sidecar,
+                handle,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            handle.write("\n")
+        os.replace(checkpoint_temporary, destination_path)
+        moved_checkpoint = True
+        os.replace(sidecar_temporary, destination_sidecar)
+    except Exception:
+        if moved_checkpoint:
+            destination_path.unlink(missing_ok=True)
+        raise
+    finally:
+        checkpoint_temporary.unlink(missing_ok=True)
+        sidecar_temporary.unlink(missing_ok=True)
+
+    try:
+        release_provenance = verified_checkpoint_provenance(destination_path)
+    except Exception:
+        destination_path.unlink(missing_ok=True)
+        destination_sidecar.unlink(missing_ok=True)
+        raise
+    release_provenance["release_artifact_sanitized"] = True
+    return release_provenance
 
 
 def _resolve_device(requested: str):

@@ -133,6 +133,43 @@ Keeping both makes the analysis easier to audit later.
 - Saturated exposures are not used for quantitative conclusions.
 - Exported figures are kept with their source data and project JSON.
 
+## Optional: build a trustworthy detector holdout
+
+Do this only when comparing detector methods or validating a locally trained
+model. A holdout is not a collection of convenient leftover images.
+
+1. Choose complete studies that were never used for fitting, threshold tuning,
+   model selection, or informal debugging. Keep the study groups intact.
+2. In BlotGrid, inspect the entire image and manually add every real clear,
+   faint, and doublet band. Approve the bands and attest whole-image
+   completeness. In the sealed COCO annotation record, have a person also mark
+   and approve border, printed-text, smear, and truly blank artifact regions;
+   BlotGrid does not infer those ground-truth labels.
+3. Record every development/model-selection image hash and study group in a
+   versioned complete ledger. Seal the holdout annotation JSON, image hashes,
+   and study groups before running any candidate.
+4. Run the `prepare` command in the
+   [sealed detector comparison](../README.md#sealed-detector-comparison).
+   Give the reviewer the generated `reviewer_packet` directory and read-only,
+   out-of-band access to the exact sealed `--images` directory. Do not give
+   them the annotations, seal, or `evaluator_private/`; the packet contains no
+   method names or ground truth.
+5. For each task in `review_order.csv`, the reviewer restores the matching
+   project JSON in BlotGrid, re-uploads the sealed images, reviews every whole
+   image, corrects the fixed-size boxes, and approves active ROIs. Evaluator
+   resize handles and size controls are locked, so boxes may be moved, added,
+   or disabled without changing the frozen dimensions. Save each completed
+   project to a separate folder using the task's original `<task-id>.json`
+   filename.
+6. Create a schema-1 review attestation naming the protocol and reviewer and
+   explicitly confirming blinded review, no ground-truth viewing, and
+   whole-image review. Then run the `score` command.
+
+BlotGrid rechecks the seal, development ancestry, model ancestry, proposal
+bindings, reviewed file hashes, and equal-review geometry before producing any
+metrics. A failed check should be investigated; do not edit the run files to
+force scoring.
+
 ## Common problems
 
 ### The command `streamlit` is not found
