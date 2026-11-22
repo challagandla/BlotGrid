@@ -229,6 +229,109 @@ project** brings them back; re-upload the images and re-run Quantify. Images are
 not embedded in the JSON. Saved SHA-256 identities must match before a restored
 layout is applied; a same-named different image is rejected.
 
+## Composite figures (many framed tiles)
+
+Published figures are often a grid of small, separately framed blot
+tiles (each tile = one target in one cell line, two lanes: Control and
+treated), with headers and labels around them. `wblot/composite.py` quantifies
+such a figure directly, without the Streamlit app.
+
+1. Describe the grid in a layout JSON (see
+   [`examples/composite_layout_example.json`](examples/composite_layout_example.json)):
+   row blocks (variant + targets, top to bottom), column blocks (condition +
+   cell lines, left to right), the loading-control target and the lane labels.
+   When the cell line changes with the row block (e.g. a 2 x 2 grid of cell
+   lines, each with a target tile above its loading-control tile), give the row
+   block its own `cell_lines`, one per column (see
+   [`examples/composite_layout_per_block_cell_lines.json`](examples/composite_layout_per_block_cell_lines.json)).
+   A tile may also hold more than two lanes (e.g. a reference line and several
+   cell lines): list every lane in `lanes`; the first is the reference and each
+   other lane becomes a "<lane> vs <reference>" comparison (see
+   [`examples/composite_layout_multilane_reference.json`](examples/composite_layout_multilane_reference.json)).
+   Plot such data with `layout=shared` (one reference bar, stacked brackets).
+2. Quantify (three independent box placements, Excel + QC images):
+
+   ```bash
+   .venv/bin/python scripts/quantify_composite.py FIGURE.tif \
+     --layout examples/composite_layout_example.json --out results/
+   ```
+
+3. Export tidy data and draw A4 bar charts with R/ggplot2 (first variant in the
+   top half, second in the bottom; black data points, mean ± SEM, GraphPad-style
+   significance brackets with Welch t-test stars, Times New Roman,
+   t-test table on page 2):
+
+   ```bash
+   .venv/bin/python scripts/export_plot_data.py results/western_blot_quantification.xlsx \
+     figures/plot_data.csv
+   Rscript scripts/plot_composite_bars.R figures/plot_data.csv figures/
+   ```
+
+   Options (`key=value` after the two paths) set colours per variant, title,
+   loading-control label, y-axis title, figure size and file stem, e.g. a single
+   120 x 100 mm panel:
+
+   ```bash
+   Rscript scripts/plot_composite_bars.R figures/plot_data.csv figures/ \
+     "palette.A=#D4D4D4,#410257" "title=Target overexpression" \
+     control=GAPDH width_mm=120 height_mm=100 name=target_bar_chart
+   ```
+
+   In RStudio, set `plot_args` to the same strings and source the script; the
+   figure is drawn in the Plots pane and kept as `fig` (add `save=false` to
+   leave the exported files untouched):
+
+   ```r
+   plot_args <- c("figures/plot_data.csv", "figures", "save=false")
+   source("scripts/plot_composite_bars.R", encoding = "UTF-8")
+   ```
+
+   Legend and panel labels come from the layout's lane labels. Only bars whose
+   control band is missing (QC UNRELIABLE) or extreme outliers (> 8x) are cut
+   at the axis limit.
+
+   R needs `ggplot2`, `dplyr`, `tidyr`, `patchwork`, `openxlsx`, `gridExtra` and `ragg`
+   (Times New Roman must be installed). Without `palette.<variant>` options,
+   Control bars are grey and treated bars use colour-blind-safe Okabe-Ito colours.
+
+How each tile is measured:
+
+- **Tiles and grid:** closed dark frames are found and clustered into rows and
+  columns; the frame lines are excluded.
+- **Background:** a per-column vertical rolling window several band
+  thicknesses tall removes shading, streaks and blotchy background while
+  keeping thin horizontal bands.
+- **Split between the two bands:** the column-profile valley that is a real dip
+  (lower than the bands on both sides) and nearest the mirror-symmetry
+  midpoint, so touching bands split at their junction, a faint knockdown band
+  next to a strong control keeps its own lane, and a dumbbell band's pale
+  middle is never chosen.
+- **Band extent:** dark core(s) merged into one span (dumbbell = one band),
+  then grown along faded tails until the signal reaches the tile's own
+  background level (measured in band-free rows); vertical edges are measured
+  above a local straight baseline (gradient-safe).
+- **One box size per tile:** set by the longer and thicker band; the other
+  box may cover empty background but never reaches into the neighbouring
+  band, and the two boxes never overlap. A missing band's box sits at the
+  mirror position of the present band.
+- **Measurement:** ImageJ Gel-Analyzer-style peak area (box profile, straight
+  baseline between the valleys either side of the band) plus a rectangle
+  integrated density whose background comes from the strips above and below
+  the box. Normalisation is target / loading control of the same lane; fold
+  change is treated / Control.
+- **QC:** saturation (near-black pixels), boxes that could not cover their
+  band, vertical doublets, irregular tiles, faint/absent control bands and
+  run-to-run spread are reported per fold change as OK / CHECK / UNRELIABLE,
+  with a zoomed per-tile QC sheet.
+
+Repeat measurements: band geometry is detected once with fixed settings. In
+each run every box moves by a seeded random -1/0/+1 px and the tile's shared
+box size changes by -1/0/+1 px; the ImageJ baseline window stays anchored to
+the detected band. Detection settings are not varied between runs, because
+that changes the measured region rather than repeating the measurement. The
+repeats are **technical** replicates of one image: their P values reflect
+measurement precision, not biological replication.
+
 ## Layout
 
 ```
@@ -247,6 +350,7 @@ wblot/
   holdout_evaluation.py sealed holdout validation, matching, and paired errors
   gelgenie.py          verified pretrained ONNX segmentation-to-ROI adapter
   sam_refiner.py       optional fixed-size ROI recentering with SAM 2.1
+  composite.py         multi-tile figures: tiles, band split/extent, shared boxes
 scripts/
   setup_ubuntu.sh      creates the Ubuntu environment (optional CPU/CUDA ML)
   download_pretrained_models.py
@@ -256,10 +360,18 @@ scripts/
   train_detector.py
   check_checkpoint_release.py
   evaluate_detector.py
+  quantify_composite.py  quantify a composite figure -> Excel + QC images
+  export_plot_data.py    tidy per-run data for plotting
+  plot_composite_bars.R  A4 ggplot2 bar charts, Welch t-tests, stars
+examples/
+  composite_layout_example.json
+  composite_layout_per_block_cell_lines.json
+  composite_layout_multilane_reference.json
 make_sample_blot.py    generates a synthetic 3x3 demo blot
 test_core.py           core unit tests
 test_ml_support.py     AI/export safety tests (Torch is imported only when needed)
 test_app_evaluator_policy.py evaluator-review UI lock tests
+test_composite.py      composite tiles: split, dumbbell/comet bands, shared boxes
 test_checkpoint_release.py checkpoint/sidecar release-binding tests
 test_holdout_evaluation.py sealed comparison and native-pixel metric tests
 test_holdout_security.py evaluator privacy and aggregation security tests
@@ -273,7 +385,7 @@ test_holdout_security.py evaluator privacy and aggregation security tests
   test_core.py test_ml_support.py test_sam_refiner.py \
   test_public_training_data.py test_checkpoint_release.py \
   test_holdout_evaluation.py test_holdout_security.py \
-  test_app_evaluator_policy.py
+  test_app_evaluator_policy.py test_composite.py
 ```
 
 Covers OCR label classification and unlabeled-lane inference, automatic dark/light

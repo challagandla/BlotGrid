@@ -1,0 +1,11 @@
+{
+  "row_blocks": [
+    {"name": "Target", "targets": ["Target", "Loading control"], "cell_lines": ["Line 1", "Line 2"]},
+    {"name": "Target", "targets": ["Target", "Loading control"], "cell_lines": ["Line 3", "Line 4"]}
+  ],
+  "col_blocks": [
+    {"condition": "OE", "cell_lines": ["left", "right"]}
+  ],
+  "control_target": "Loading control",
+  "lanes": ["Vector", "Target-OE"]
+}

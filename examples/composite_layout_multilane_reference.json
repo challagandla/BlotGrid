@@ -1,0 +1,10 @@
+{
+  "row_blocks": [
+    {"name": "Target", "targets": ["Target", "Loading control"]}
+  ],
+  "col_blocks": [
+    {"condition": "Panel", "cell_lines": ["panel"]}
+  ],
+  "control_target": "Loading control",
+  "lanes": ["Reference", "Line 1", "Line 2", "Line 3", "Line 4"]
+}

@@ -1,0 +1,12 @@
+{
+  "row_blocks": [
+    {"name": "A", "targets": ["Target 1", "Target 2", "Target 3", "Target 4", "Loading control"]},
+    {"name": "B", "targets": ["Target 1", "Target 2", "Target 3", "Target 4", "Loading control"]}
+  ],
+  "col_blocks": [
+    {"condition": "OE", "cell_lines": ["Line 1", "Line 2", "Line 3", "Line 4"]},
+    {"condition": "KD", "cell_lines": ["Line 1", "Line 2", "Line 3", "Line 4"]}
+  ],
+  "control_target": "Loading control",
+  "lanes": ["Control", "{variant}-{condition}"]
+}
