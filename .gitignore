@@ -41,3 +41,15 @@ local-notes/
 # These completed local training records are intentionally absent from GitHub.
 docs/UBUNTU_AI_GUIDE.md
 docs/PUBLIC_BOOTSTRAP_MODEL.md
+
+# Quantification outputs and blot images stay local (only the demo image is tracked).
+results*/
+figures*/
+*_quantification.xlsx
+plot_data.csv
+ttest_results.*
+qc_overlay*.png
+qc_tiles*.png
+*.tif
+*.tiff
+!sample_blot.tif
