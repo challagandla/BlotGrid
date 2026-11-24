@@ -34,6 +34,7 @@ def test_evaluator_task_locks_detector_and_metadata_mutations():
         "Targets (one per line, top→bottom)",
         "Loading control (optional)",
         "Lanes / conditions (one per line, left→right)",
+        "Ladder / marker lanes (excluded from quantification)",
         "Detection backend",
         "AI checkpoint path",
         "Minimum AI score",
@@ -127,3 +128,23 @@ def test_evaluator_task_omits_alignment_ui_and_guards_ocr_autofill():
             guarded_autofill = True
             break
     assert guarded_autofill
+
+
+def test_clear_all_blots_discards_public_source_lineage():
+    tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
+    clear_calls = _labelled_calls(tree, "Clear all blots")
+    assert len(clear_calls) == 1
+    clear_call = clear_calls[0]
+    clear_branch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and clear_call in ast.walk(node.test)
+    )
+    cleared_string_literals = {
+        node.value
+        for statement in clear_branch.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert "source_lineage" in cleared_string_literals

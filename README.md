@@ -8,6 +8,13 @@ A local Streamlit app to quantify Western blot bands from an image, optionally
 normalize each target against a housekeeping/loading control **in the same lane**,
 aggregate replicates, and export publication-quality bar charts.
 
+Public Western images from HPA v25.1, Mendeley Data, two BioImage Archive
+studies, and Zenodo can be prepared as fail-closed review projects with
+`scripts/prepare_review_sources.py`. The downloads are not labels: follow the
+generated `data/public_western/MANUAL_LABELING.md`, and do not train until every
+accepted box and whole image has been reviewed and attested. Source and license
+scope is documented in [THIRD_PARTY_DATA.md](THIRD_PARTY_DATA.md).
+
 [Beginner tutorial](docs/BEGINNER_TUTORIAL.md) ·
 [Pretrained model workflow](docs/PRETRAINED_MODELS.md) ·
 [Holdout evaluation schema](docs/HOLDOUT_EVALUATION.md) ·
@@ -125,7 +132,11 @@ background/acquisition-style strata. Runs stay under ignored `runs/` or
    experimental conditions. A raw scan with no readable labels is inferred directly
    from its band grid and receives editable `Target 1`, `Target 2`, ... and `Lane 1`,
    `Lane 2`, ... names. Existing recognized names are retained when only part of the
-   metadata is missing. Each image is one replicate. Add several to get real SEM/SD.
+   metadata is missing. Low-confidence raw grids stay as reviewable suggestions
+   instead of replacing the setup silently. Printed `Ladder`, `Marker`, and `MW`
+   lane labels are selected in **Ladder / marker lanes** automatically; the physical
+   lane remains in left-to-right geometry but is excluded from analysis. Each image
+   is one replicate. Add several to get real SEM/SD.
 2. **ROIs** — the app automatically infers dark/light polarity, locates the lane
    and target-row centres, and draws an individual box around every detected band.
    Multiple bands in one target/lane (for example, a doublet) remain separate.
@@ -141,6 +152,7 @@ background/acquisition-style strata. Runs stay under ignored `runs/` or
    updates every rectangle and cannot selectively change one band's
    measurement area. Green boxes are accepted, red boxes are accepted loading
    controls, orange boxes need review, and dashed grey boxes are excluded.
+   Designated ladder/marker lanes receive no quantitative ROIs.
    If automatic detection misses bands, **Add missed bands manually** lets you
    choose the target and lane and create one or several extra rectangles at once;
    drag each new rectangle over its band before quantifying.
@@ -155,7 +167,8 @@ background/acquisition-style strata. Runs stay under ignored `runs/` or
    flags saturated bands and non-positive signals. Profile-guided integration is
    the default: it retains the locked lane width but integrates only the dominant
    band's vertical peak interval. Classic full-rectangle integration remains
-   available in the sidebar.
+   available in the sidebar. Ladder lanes are omitted before pixel measurement and
+   are filtered again before normalization, statistics, plots, and data export.
 4. **Normalize** — when a recognized or manually selected control is available,
    `normalized(target, lane) = target(lane) / control(lane)`. If no usable control
    is found, normalization is skipped and the app carries the background-corrected
@@ -223,7 +236,7 @@ units rather than a misleading normalized value.
 
 ## Saving a project
 
-The sidebar's **Save project (.json)** button writes labels, ROI layouts,
+The sidebar's **Save project (.json)** button writes labels, ladder-lane exclusions, ROI layouts,
 replicate numbers and all measurement settings. **Load project** + **Restore
 project** brings them back; re-upload the images and re-run Quantify. Images are
 not embedded in the JSON. Saved SHA-256 identities must match before a restored

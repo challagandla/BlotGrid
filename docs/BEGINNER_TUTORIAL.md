@@ -60,10 +60,15 @@ Use the left panel to review:
 
 - **Targets:** protein names from top to bottom.
 - **Lanes / conditions:** samples from left to right.
+- **Ladder / marker lanes:** physical ladder lanes to omit from quantification.
 - **Loading control:** choose the housekeeping protein only when one is present.
 
 If the image has no readable labels, neutral names such as `Target 1` and
 `Lane 1` are expected. Replace them with real experimental names when known.
+BlotGrid selects explicit printed labels such as `Ladder`, `Marker`, or `MW`
+automatically. Check that selection: the lane remains in the left-to-right layout
+so neighbouring samples do not shift, but it receives no ROI or measurement.
+Low-confidence raw grids are shown as suggestions and require **Apply these labels**.
 If no control exists, choose **No control — intensity only**. BlotGrid will report
 background-corrected intensity without pretending the values are normalized.
 
@@ -92,6 +97,9 @@ Do not include panel borders, labels, or neighbouring lanes inside a box.
 ## 7. Run densitometry
 
 Open **3 · Quantify** and click **Run densitometry on all blots**.
+
+The table must contain sample/condition lanes only. Designated ladder lanes are
+omitted before densitometry and remain absent from normalization and exports.
 
 Review warnings before continuing:
 

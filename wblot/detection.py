@@ -243,6 +243,96 @@ def _unknown_projection_centers(
     return tuple(int(value) for value in candidates), confidence
 
 
+def _target_guided_lane_centers(
+    signal: np.ndarray,
+    target_centers: tuple[int, ...],
+    *,
+    max_count: int,
+) -> tuple[tuple[int, ...], float]:
+    """Infer broad lane centres from narrow strips around trusted target rows.
+
+    Averaging a sparse one-row blot over the full image height can make its lane
+    projection weaker than dust or scanner-edge artefacts.  Within the target
+    row, however, broad flat-topped bands form well separated one-dimensional
+    components.  Their intensity-weighted centroids are substantially more
+    stable than local maxima, which often land on one shoulder of a saturated
+    band.
+    """
+    values = np.asarray(signal, dtype=float)
+    if values.ndim != 2 or not target_centers:
+        return (), 0.0
+    height, width = values.shape
+    if width < 3:
+        return (), 0.0
+
+    if len(target_centers) > 1:
+        row_gap = float(np.median(np.diff(target_centers)))
+        half_window = min(height * 0.035, row_gap * 0.20)
+    else:
+        half_window = height * 0.035
+    half_window = max(2, int(round(half_window)))
+
+    row_profiles: list[np.ndarray] = []
+    for center in target_centers:
+        y0 = max(0, int(center) - half_window)
+        y1 = min(height, int(center) + half_window + 1)
+        if y1 <= y0:
+            continue
+        profile = np.percentile(values[y0:y1], 80.0, axis=0)
+        profile = gaussian_filter1d(
+            profile,
+            sigma=max(0.8, width / max(max_count * 100.0, 1.0)),
+        )
+        baseline = float(np.percentile(profile, 20.0))
+        profile = np.clip(profile - baseline, 0.0, None)
+        scale = float(np.percentile(profile, 99.5))
+        if scale <= np.finfo(float).eps:
+            continue
+        row_profiles.append(np.clip(profile / scale, 0.0, 1.0))
+    if not row_profiles:
+        return (), 0.0
+
+    guided_profile = np.mean(np.stack(row_profiles), axis=0)
+    component_labels, component_count = label(guided_profile >= 0.35)
+    components: list[tuple[float, int, float, float]] = []
+    for component_id in range(1, component_count + 1):
+        indices = np.flatnonzero(component_labels == component_id)
+        if len(indices) < 2:
+            continue
+        weights = guided_profile[indices]
+        total = float(np.sum(weights))
+        if total <= np.finfo(float).eps:
+            continue
+        center = float(np.sum(indices * weights) / total)
+        components.append((center, len(indices), float(np.max(weights)), total))
+    if not components:
+        return (), 0.0
+
+    if len(components) > max_count:
+        components = sorted(components, key=lambda item: item[3])[-max_count:]
+    components.sort(key=lambda item: item[0])
+    centers = tuple(int(round(item[0])) for item in components)
+    widths = np.asarray([item[1] for item in components], dtype=float)
+    peak_strength = float(np.median([item[2] for item in components]))
+
+    if len(centers) > 1:
+        gaps = np.diff(centers).astype(float)
+        typical_gap = max(float(np.median(gaps)), 1.0)
+        gap_deviation = float(np.median(np.abs(gaps - typical_gap))) / typical_gap
+        spacing_confidence = float(np.clip(1.0 - 3.0 * gap_deviation, 0.0, 1.0))
+    else:
+        spacing_confidence = 0.45
+    typical_width = max(float(np.median(widths)), 1.0)
+    width_deviation = float(np.median(np.abs(widths - typical_width))) / typical_width
+    width_confidence = float(np.clip(1.0 - 2.0 * width_deviation, 0.0, 1.0))
+    confidence = peak_strength * (
+        0.55 + 0.30 * spacing_confidence + 0.15 * width_confidence
+    )
+    if len(centers) == 1 and widths[0] > width * 0.35:
+        confidence *= 0.25
+    return centers, float(np.clip(confidence, 0.0, 1.0))
+
+
 def infer_raw_grid(
     gray: np.ndarray,
     *,
@@ -262,14 +352,45 @@ def infer_raw_grid(
     bands_are_dark, polarity_confidence = infer_band_polarity(arr, 3, 3)
     signal = 1.0 - norm if bands_are_dark else norm
     enhanced = np.clip(_enhance(signal, 4, 4), 0.0, None)
-    enhanced[_line_artifact_mask(enhanced, 3, 3)] = 0.0
+    masked_enhanced = enhanced.copy()
+    masked_enhanced[_line_artifact_mask(enhanced, 3, 3)] = 0.0
 
-    target_centers, target_confidence = _unknown_projection_centers(
+    structure_floor = 12.0 if polarity_confidence < 0.08 else 6.5
+    masked_targets, masked_target_confidence = _unknown_projection_centers(
+        masked_enhanced, axis=0, max_count=max_targets,
+        min_structure_ratio=structure_floor)
+    unmasked_targets, unmasked_target_confidence = _unknown_projection_centers(
         enhanced, axis=0, max_count=max_targets,
-        min_structure_ratio=12.0 if polarity_confidence < 0.08 else 6.5)
+        min_structure_ratio=structure_floor)
+
+    # A row of broad, closely spaced real bands can satisfy the horizontal-line
+    # opening and disappear from the masked projection.  Prefer the unmasked row
+    # only when its structure is materially more convincing; ordinary bordered
+    # multi-row panels continue to use the artefact-cleaned inference.
+    prefer_unmasked_targets = (
+        unmasked_target_confidence >= 0.25
+        and unmasked_target_confidence
+        > masked_target_confidence + max(0.10, masked_target_confidence * 0.25)
+    )
+    if prefer_unmasked_targets:
+        target_centers = unmasked_targets
+        target_confidence = unmasked_target_confidence
+    else:
+        target_centers = masked_targets
+        target_confidence = masked_target_confidence
+
     lane_centers, lane_confidence = _unknown_projection_centers(
-        enhanced, axis=1, max_count=max_lanes,
-        min_structure_ratio=12.0 if polarity_confidence < 0.08 else 6.5)
+        masked_enhanced, axis=1, max_count=max_lanes,
+        min_structure_ratio=structure_floor)
+    guided_lanes, guided_lane_confidence = _target_guided_lane_centers(
+        signal, target_centers, max_count=max_lanes)
+    if (
+        guided_lanes
+        and guided_lane_confidence >= 0.45
+        and guided_lane_confidence > lane_confidence + 0.08
+    ):
+        lane_centers = guided_lanes
+        lane_confidence = guided_lane_confidence
     if (polarity_confidence < 0.04
             and (target_confidence == 0.0 or lane_confidence == 0.0)):
         target_centers = (arr.shape[0] // 2,)
@@ -400,6 +521,16 @@ def _validated_centers_hint(
     if any(b <= a for a, b in zip(centers[:-1], centers[1:])):
         raise ValueError(f"{label} centre hints must be strictly ordered.")
     return centers
+
+
+def _excluded_lane_keys(
+    excluded_lanes: list[str] | tuple[str, ...] | set[str] | str | None,
+) -> set[str]:
+    """Return normalized lane names that must never produce measurements."""
+    if excluded_lanes is None:
+        return set()
+    values = (excluded_lanes,) if isinstance(excluded_lanes, str) else excluded_lanes
+    return {str(value).strip().casefold() for value in values if str(value).strip()}
 
 
 def _robust_noise(values: np.ndarray) -> float:
@@ -783,6 +914,7 @@ def detect_bands(
     sensitivity: float = 0.65,
     lane_centers_hint: list[int] | tuple[int, ...] | None = None,
     target_centers_hint: list[int] | tuple[int, ...] | None = None,
+    excluded_lanes: list[str] | tuple[str, ...] | set[str] | str | None = None,
 ) -> DetectionResult:
     """Automatically detect every band and assign it to a target and lane.
 
@@ -800,10 +932,17 @@ def detect_bands(
     lane_centers_hint, target_centers_hint:
         Optional trusted spatial coordinates, typically read from the image's
         panel grid and target-label positions by the local OCR stage.
+    excluded_lanes:
+        Optional physical lane names, such as a molecular-weight ladder, that
+        remain part of lane-centre geometry but never receive band proposals.
     """
     arr = _finite_image(gray)
     targets = [str(v) for v in targets]
     lanes = [str(v) for v in lanes]
+    excluded_lane_keys = _excluded_lane_keys(excluded_lanes)
+    quantifiable_lanes = [
+        lane for lane in lanes if lane.strip().casefold() not in excluded_lane_keys
+    ]
     if not targets or not lanes:
         raise ValueError("At least one target and one lane are required.")
     if polarity not in {"auto", "dark", "light"}:
@@ -839,8 +978,9 @@ def detect_bands(
     bands: list[DetectedBand] = []
     lane_spacing = (float(np.median(np.diff(lane_centers)))
                     if len(lane_centers) > 1 else float(arr.shape[1]))
-    target_gaps = np.diff(target_centers)
     for lane, lane_center, x_bounds in zip(lanes, lane_centers, x_cells):
+        if lane.strip().casefold() in excluded_lane_keys:
+            continue
         x0, x1 = x_bounds
         # Trim only the extreme cell edges; using most of the cell makes the
         # method tolerant of curved or slightly diagonal lanes.
@@ -1006,8 +1146,8 @@ def detect_bands(
     _standardize_boxes(bands, arr.shape)
     bands.sort(key=lambda b: (targets.index(b.target), lanes.index(b.lane), b.y, b.x))
     warnings: list[str] = []
-    expected = len(targets) * len(lanes)
-    if not bands:
+    expected = len(targets) * len(quantifiable_lanes)
+    if not bands and expected:
         warnings.append("No bands passed the automatic detector; try higher sensitivity or override polarity.")
     elif len(bands) < expected:
         warnings.append(
@@ -1039,18 +1179,29 @@ def ensure_complete_grid(
     *,
     gray: np.ndarray | None = None,
     sensitivity: float = 0.65,
+    excluded_lanes: list[str] | tuple[str, ...] | set[str] | str | None = None,
 ) -> int:
     """Add a reviewable equal-size ROI to every otherwise empty grid cell.
 
     A missing signal peak must not make a target/lane measurement disappear.
     Low-confidence fallback rectangles are centred on the OCR-derived grid and
-    remain editable in the same way as directly detected bands.
+    remain editable in the same way as directly detected bands. Physical lanes
+    named by ``excluded_lanes`` retain their centres but cannot retain or gain a
+    proposal.
     """
     targets = [str(value) for value in targets]
     lanes = [str(value) for value in lanes]
+    excluded_lane_keys = _excluded_lane_keys(excluded_lanes)
     H, W = image_shape
     if len(result.target_centers) != len(targets) or len(result.lane_centers) != len(lanes):
         raise ValueError("Detected grid dimensions do not match the experiment setup.")
+
+    # Other proposal backends can feed this completion pass. Enforce the same
+    # fail-closed ladder rule even if such a backend emitted an excluded lane.
+    result.bands = [
+        band for band in result.bands
+        if band.lane.strip().casefold() not in excluded_lane_keys
+    ]
 
     if result.bands:
         shared_w, shared_h = result.bands[0].w, result.bands[0].h
@@ -1083,6 +1234,8 @@ def ensure_complete_grid(
     excluded = 0
     for target, cy in zip(targets, result.target_centers):
         for lane, cx in zip(lanes, result.lane_centers):
+            if lane.strip().casefold() in excluded_lane_keys:
+                continue
             if (target, lane) in occupied:
                 continue
             x = int(np.clip(round(cx - shared_w / 2.0), 0, W - shared_w))

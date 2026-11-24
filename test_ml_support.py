@@ -1205,8 +1205,127 @@ def test_project_export_defaults_to_approved_nonfallback_active_boxes(tmp_path):
     assert summary["dropped_unattested_empty_images"] == 0
     assert coco["images"][0]["blotgrid"]["study_group"] == "Study One"
     assert coco["blotgrid"]["annotation_policy"] == "human_approved_only"
+    assert coco["licenses"] == []
+    assert "license_lineage_schema_version" not in coco["blotgrid"]
     with pytest.raises(MLTrainingError, match="already exists"):
         export_project_to_coco(project, tmp_path, output)
+
+
+def test_project_export_carries_validated_source_and_license_lineage(tmp_path):
+    image_path = tmp_path / "public-blot.png"
+    Image.fromarray(np.zeros((24, 30), dtype=np.uint8)).save(image_path)
+    project = _sample_project(image_path.name, _sha256(image_path))
+    attribution = (
+        "Example Public Blots (2026), doi:10.1234/public-blots"
+    )
+    project["source_lineage"] = {
+        "schema_version": 1,
+        "info": {
+            "title": "Public Western blot review set",
+            "version": "2026.1",
+            "source_dois": ["10.1234/public-blots"],
+        },
+        "licenses": [
+            {
+                "id": 3,
+                "name": "Creative Commons Zero v1.0 Universal",
+                "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+                "spdx_identifier": "CC0-1.0",
+                "publication_assessment": {
+                    "status": "cleared",
+                    "redistribution_cleared": True,
+                    "commercial_use_cleared": True,
+                    "attribution_required": False,
+                    "share_alike_required": False,
+                    "obligations": [],
+                },
+            }
+        ],
+        "sources": [
+            {
+                "id": "public-blots",
+                "doi": "10.1234/public-blots",
+                "url": "https://doi.org/10.1234/public-blots",
+                "license_id": 3,
+                "required_attribution": attribution,
+                "publication_assessment": {
+                    "status": "cleared",
+                    "redistribution_cleared": True,
+                    "attribution_resolved": True,
+                    "license_id": 3,
+                },
+            }
+        ],
+        "images": {
+            image_path.name: {
+                "source_id": "public-blots",
+                "source_archive": "public-blots.zip",
+                "source_image": "raw/public-blot.png",
+                "upstream_url": "https://example.test/raw/public-blot.png",
+            }
+        },
+    }
+
+    coco = export_project_to_coco(project, tmp_path)
+
+    assert coco["info"]["title"] == "Public Western blot review set"
+    assert coco["info"]["version"] == "2026.1"
+    assert coco["info"]["source_dois"] == ["10.1234/public-blots"]
+    assert coco["licenses"] == project["source_lineage"]["licenses"]
+    assert coco["blotgrid"]["license_lineage_schema_version"] == 1
+    assert coco["blotgrid"]["sources"] == project["source_lineage"]["sources"]
+    image_record = coco["images"][0]
+    assert image_record["license"] == 3
+    assert image_record["blotgrid"]["source_id"] == "public-blots"
+    assert image_record["blotgrid"]["source_doi"] == "10.1234/public-blots"
+    assert image_record["blotgrid"]["source_url"] == (
+        "https://doi.org/10.1234/public-blots"
+    )
+    assert image_record["blotgrid"]["required_attribution"] == attribution
+    assert image_record["blotgrid"]["source_archive"] == "public-blots.zip"
+    assert image_record["blotgrid"]["source_image"] == "raw/public-blot.png"
+    assert image_record["blotgrid"]["upstream_url"] == (
+        "https://example.test/raw/public-blot.png"
+    )
+    extracted = _extract_dataset_license_lineage(coco)
+    assert extracted["summary"] == {
+        "images": 1,
+        "images_without_declared_license": 0,
+        "images_without_declared_source": 0,
+    }
+
+
+def test_project_export_rejects_incomplete_declared_source_lineage(tmp_path):
+    image_path = tmp_path / "public-blot.png"
+    Image.fromarray(np.zeros((24, 30), dtype=np.uint8)).save(image_path)
+    project = _sample_project(image_path.name, _sha256(image_path))
+    project["source_lineage"] = {
+        "schema_version": 1,
+        "info": {"source_dois": []},
+        "licenses": [{"id": 1}],
+        "sources": [{"id": "source", "license_id": 1}],
+        "images": {},
+    }
+
+    with pytest.raises(MLTrainingError, match="does not exactly match"):
+        export_project_to_coco(project, tmp_path)
+
+
+def test_project_export_requires_explicit_source_lineage_schema_version(tmp_path):
+    image_path = tmp_path / "public-blot.png"
+    Image.fromarray(np.zeros((24, 30), dtype=np.uint8)).save(image_path)
+    project = _sample_project(image_path.name, _sha256(image_path))
+    project["source_lineage"] = {
+        "info": {"source_dois": []},
+        "licenses": [{"id": 1}],
+        "sources": [{"id": "source", "license_id": 1}],
+        "images": {
+            image_path.name: {"source_id": "source", "license_id": 1}
+        },
+    }
+
+    with pytest.raises(MLTrainingError, match="schema_version"):
+        export_project_to_coco(project, tmp_path)
 
 
 def test_project_export_marks_opt_in_pseudo_labels(tmp_path):
@@ -1593,6 +1712,37 @@ def test_checkpoint_publication_gate_emits_attribution_for_scratch_model():
     assert assessment["attribution_bundle"]["sources"][0][
         "required_attribution"
     ].startswith("Example Dataset")
+
+
+def test_checkpoint_publication_gate_accepts_exact_cc0_policy():
+    provenance = _publication_provenance()
+    license_record = provenance["metadata"]["dataset_license_lineage"][
+        "licenses"
+    ][0]
+    license_record.update(
+        {
+            "name": "Creative Commons Zero v1.0 Universal",
+            "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+            "spdx_identifier": "CC0-1.0",
+            "publication_assessment": {
+                "status": "cleared",
+                "redistribution_cleared": True,
+                "commercial_use_cleared": True,
+                "attribution_required": False,
+                "share_alike_required": False,
+                "obligations": [],
+            },
+        }
+    )
+    _resign_lineage(provenance["metadata"]["dataset_license_lineage"])
+
+    assessment = checkpoint_publication_assessment(provenance)
+
+    assert assessment["eligible_for_publication"] is True
+    assert assessment["blockers"] == []
+    assert assessment["attribution_bundle"]["licenses"][0][
+        "spdx_identifier"
+    ] == "CC0-1.0"
 
 
 def test_checkpoint_publication_gate_requires_embedded_metadata_binding():
