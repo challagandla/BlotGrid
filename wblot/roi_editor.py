@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
+import hashlib
 import io
 from pathlib import Path
+import threading
 
 import numpy as np
 from PIL import Image
@@ -12,16 +15,52 @@ import streamlit.components.v1 as components
 
 _FRONTEND = Path(__file__).with_name("roi_editor_frontend")
 _component = components.declare_component("wblot_roi_editor", path=str(_FRONTEND))
+_CACHE_SIZE = 8
+
+
+def _bounded_cache(func):
+    """Small thread-safe LRU keyed on the digest only (arrays are unhashable)."""
+    entries: OrderedDict[str, str] = OrderedDict()
+    lock = threading.Lock()
+
+    def wrapper(digest: str, arr: np.ndarray) -> str:
+        with lock:
+            if digest in entries:
+                entries.move_to_end(digest)
+                return entries[digest]
+        value = func(digest, arr)
+        with lock:
+            entries[digest] = value
+            entries.move_to_end(digest)
+            while len(entries) > _CACHE_SIZE:
+                entries.popitem(last=False)
+        return value
+
+    wrapper.cache_clear = entries.clear  # type: ignore[attr-defined]
+    return wrapper
 
 
 def _image_data_url(display_image: np.ndarray) -> str:
-    """Encode an 8-bit display image for the self-contained canvas component."""
+    """Encode an 8-bit display image for the self-contained canvas component.
+
+    Every ROI click reruns the script, so encodings are memoized by a content
+    digest: hashing is far cheaper than PNG compression of a large scan.
+    """
     arr = np.asarray(display_image)
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
+    arr = np.ascontiguousarray(arr)
+    digest = hashlib.blake2b(arr.data, digest_size=16)
+    digest.update(repr((arr.shape, arr.dtype.str)).encode("ascii"))
+    return _encode_png_data_url(digest.hexdigest(), arr)
+
+
+@_bounded_cache
+def _encode_png_data_url(digest: str, arr: np.ndarray) -> str:
     image = Image.fromarray(arr, mode="L" if arr.ndim == 2 else None)
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    # Lossless either way; level 1 is several times faster than the default.
+    image.save(buffer, format="PNG", compress_level=1)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 

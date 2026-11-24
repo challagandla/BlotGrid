@@ -1,0 +1,121 @@
+name: Desktop builds
+
+# Builds the standalone BlotGrid app for Ubuntu, Windows and macOS, smoke-tests
+# each bundle, and attaches the archives plus SHA256 checksums to a GitHub
+# release when a v* tag is pushed.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "blotgrid_desktop.py"
+      - "packaging/**"
+      - "requirements*.txt"
+      - ".streamlit/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x64
+            exe: dist/BlotGrid/BlotGrid
+          - os: windows-latest
+            label: windows-x64
+            exe: dist/BlotGrid/BlotGrid.exe
+          - os: macos-latest
+            label: macos-arm64
+            exe: dist/BlotGrid.app/Contents/MacOS/BlotGrid
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install -r requirements-build.txt
+          # Headless OpenCV: same cv2 API without the bundled Qt/FFmpeg.
+          v=$(python -c "import importlib.metadata as m; print(m.version('opencv-python'))")
+          python -m pip uninstall -y opencv-python
+          python -m pip install "opencv-python-headless==${v}"
+
+      - name: Tests (full suite)
+        if: runner.os == 'Linux'
+        run: python -m pytest -q
+
+      - name: Tests (core + desktop)
+        if: runner.os != 'Linux'
+        run: python -m pytest -q test_desktop.py test_core.py test_composite.py
+
+      - name: Build bundle
+        run: pyinstaller packaging/blotgrid.spec --noconfirm
+
+      - name: Smoke test bundle
+        run: python packaging/smoke_test.py "${{ matrix.exe }}"
+
+      - name: Archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="BlotGrid-${{ github.ref_name }}-${{ matrix.label }}"
+          name="${name//\//-}"
+          cd dist
+          case "${{ runner.os }}" in
+            Windows) 7z a -tzip "../${name}.zip" BlotGrid >/dev/null; f="${name}.zip" ;;
+            macOS)   ditto -c -k --sequesterRsrc --keepParent BlotGrid.app "../${name}.zip"; f="${name}.zip" ;;
+            Linux)   tar -czf "../${name}.tar.gz" BlotGrid; f="${name}.tar.gz" ;;
+          esac
+          cd ..
+          if command -v sha256sum >/dev/null; then sha256sum "$f" > "$f.sha256"; else shasum -a 256 "$f" > "$f.sha256"; fi
+          echo "ARCHIVE=$f" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: BlotGrid-${{ matrix.label }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat artifacts/*.sha256 > artifacts/SHA256SUMS.txt
+          gh release create "${{ github.ref_name }}" artifacts/* \
+            --repo "${{ github.repository }}" --title "BlotGrid ${{ github.ref_name }}" \
+            --generate-notes --draft

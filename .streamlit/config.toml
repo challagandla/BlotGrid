@@ -1,0 +1,63 @@
+# BlotGrid Streamlit configuration. Used by `streamlit run app.py` from a
+# checkout and read by blotgrid_desktop.py for the packaged desktop app.
+
+[server]
+# Local-only, single-user tool: never listen on the network.
+address = "127.0.0.1"
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+enableXsrfProtection = true
+enableCORS = true
+maxUploadSize = 500
+enableStaticServing = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "stacktrace"
+
+[runner]
+fastReruns = true
+
+# Theme: Linear (VoltAgent/awesome-design-md, MIT). Users can switch
+# between light and dark in the app menu; dark follows Linear exactly.
+[theme]
+font = 'Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif'
+codeFont = '"JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace'
+baseFontSize = 14
+baseRadius = "8px"
+buttonRadius = "8px"
+showWidgetBorder = true
+showSidebarBorder = true
+chartCategoricalColors = ["#5e6ad2", "#27a644", "#d97706", "#0ea5e9", "#db2777", "#7a7fad", "#8a8f98"]
+
+[theme.dark]
+primaryColor = "#5e6ad2"
+backgroundColor = "#010102"
+secondaryBackgroundColor = "#141516"
+textColor = "#f7f8f8"
+linkColor = "#828fff"
+borderColor = "#23252a"
+dataframeBorderColor = "#23252a"
+
+[theme.dark.sidebar]
+backgroundColor = "#0f1011"
+secondaryBackgroundColor = "#18191a"
+borderColor = "#23252a"
+
+[theme.light]
+primaryColor = "#5e6ad2"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f6f6"
+textColor = "#0f1011"
+linkColor = "#5e6ad2"
+borderColor = "#e3e4e8"
+dataframeBorderColor = "#e3e4e8"
+
+[theme.light.sidebar]
+backgroundColor = "#f6f7f7"
+secondaryBackgroundColor = "#ffffff"
+borderColor = "#e3e4e8"

@@ -13,17 +13,13 @@ import copy
 import hashlib
 import io
 import os
-from pathlib import Path
+import threading
 
-# Keep Matplotlib's cache in the standard Linux user-cache location. Launchers or
-# managed systems can override either MPLCONFIGDIR or XDG_CACHE_HOME.
-_cache_root = Path(
-    os.environ.get("XDG_CACHE_HOME", Path(__file__).resolve().parent / ".cache")
-)
-os.environ.setdefault(
-    "MPLCONFIGDIR",
-    str(_cache_root / "blotgrid" / "matplotlib"),
-)
+from wblot import paths as _paths
+
+# Keep Matplotlib's cache in the per-user cache directory for this platform
+# (repo-local .cache in a checkout). MPLCONFIGDIR still overrides it.
+os.environ.setdefault("MPLCONFIGDIR", str(_paths.cache_dir() / "matplotlib"))
 
 import numpy as np
 import pandas as pd
@@ -37,8 +33,46 @@ from wblot import (alignment, detection, image_io, densitometry, normalization, 
                    plotting, project_io, roi_constraints, roi_editor,
                    gelgenie, holdout_evaluation, label_ocr, ml_detector,
                    sam_refiner)
+from wblot import desktop_guard, ui_theme
 
 st.set_page_config(page_title="BlotGrid", page_icon="▦", layout="wide")
+desktop_guard.enforce()
+ui_theme.apply()
+
+# Matplotlib's pyplot state is shared; deferred downloads render on worker threads.
+_EXPORT_LOCK = threading.Lock()
+
+
+def _deferred_chart_export(sub, options, raw_points, order, fmt):
+    """Return a callable that renders the bar chart only when downloaded."""
+    sub = sub.copy()
+    options = copy.deepcopy(options)
+    raw_points = None if raw_points is None else raw_points.copy()
+    order = list(order)
+
+    def build() -> bytes:
+        with _EXPORT_LOCK:
+            fig = plotting.bar_chart(sub, options, raw_points=raw_points,
+                                     order=order, value_col="mean")
+            try:
+                buf = io.BytesIO()
+                fig.savefig(buf, format=fmt, dpi=options.dpi, bbox_inches="tight")
+                return buf.getvalue()
+            finally:
+                plt.close(fig)
+
+    return build
+
+
+def _deferred_xlsx_export(tables):
+    """Return a callable that builds the workbook only when downloaded."""
+    frozen = {name: df.copy() for name, df in tables.items() if df is not None}
+
+    def build() -> bytes:
+        from wblot.excel_export import dataframes_to_xlsx
+        return dataframes_to_xlsx(frozen)
+
+    return build
 
 # ----------------------------------------------------------------------------
 # Session state
@@ -1050,7 +1084,12 @@ with tabs[0]:
         for i, up in enumerate(ups):
             name = up.name
             upload_bytes = up.getvalue()
-            upload_sha = hashlib.sha256(upload_bytes).hexdigest()
+            # Hash each upload once; file_id is unique per uploaded payload.
+            sha_memo = S.setdefault("_upload_sha_memo", {})
+            upload_sha = sha_memo.get(up.file_id)
+            if upload_sha is None:
+                upload_sha = hashlib.sha256(upload_bytes).hexdigest()
+                sha_memo[up.file_id] = upload_sha
             prior_seen_sha = seen_upload_names.get(name)
             if prior_seen_sha is not None:
                 if prior_seen_sha != upload_sha:
@@ -2166,10 +2205,10 @@ with tabs[5]:
 
         st.markdown("**Export**")
         ec = st.columns(4)
+        # Files are rendered on click, not on every rerun.
         for i, fmt in enumerate(["png", "tiff", "svg", "pdf"]):
-            buf = io.BytesIO()
-            fig.savefig(buf, format=fmt, dpi=o.dpi, bbox_inches="tight")
-            ec[i].download_button(f"{fmt.upper()}", buf.getvalue(),
+            ec[i].download_button(f"{fmt.upper()}",
+                                  _deferred_chart_export(sub, o, raw_pts, S["lanes"], fmt),
                                   file_name=f"{tgt}_barchart.{fmt}",
                                   mime="application/octet-stream", key=f"dl_{fmt}")
         plt.close(fig)
@@ -2180,8 +2219,6 @@ with tabs[5]:
                               file_name="summary.csv", mime="text/csv")
         # Keep workbook creation genuinely in memory. openpyxl serializes worksheets
         # through the system TEMP directory, which can fail when C: has no free space.
-        from wblot.excel_export import dataframes_to_xlsx
-
         export_tables = {"summary": summary}
         if S["normalized"] is not None:
             export_tables["normalized"] = S["normalized"]
@@ -2189,7 +2226,6 @@ with tabs[5]:
             export_tables["intensity_values"] = S["analysis_values"]
         if S["measurements"] is not None:
             export_tables["raw_densitometry"] = S["measurements"]
-        xbuf = io.BytesIO(dataframes_to_xlsx(export_tables))
-        dc[1].download_button("All data XLSX", xbuf.getvalue(),
+        dc[1].download_button("All data XLSX", _deferred_xlsx_export(export_tables),
                               file_name="western_blot_data.xlsx",
                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
