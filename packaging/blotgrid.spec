@@ -82,6 +82,25 @@ hiddenimports = (
     ]
 )
 
+runtime_hooks = []
+if IS_MAC:
+    # OpenCV in a .app: Python files land in Contents/Resources/cv2, the binary
+    # in Contents/Frameworks/cv2. Point the loader at the binary; see
+    # packaging/rthook_cv2_macos.py. config-3.X.py takes precedence over the
+    # wheel's config-3.py and runs with the loader's LOADER_DIR, sys and os.
+    import tempfile
+    _cv2_cfg = Path(tempfile.mkdtemp(prefix="blotgrid-cv2-")) / (
+        f"config-{sys.version_info[0]}.{sys.version_info[1]}.py")
+    _cv2_cfg.write_text(
+        "PYTHON_EXTENSIONS_PATHS = [\n"
+        "    os.path.join(sys._MEIPASS, 'cv2'),\n"
+        "    LOADER_DIR,\n"
+        "] + PYTHON_EXTENSIONS_PATHS\n",
+        encoding="utf-8",
+    )
+    datas.append((str(_cv2_cfg), "cv2"))
+    runtime_hooks.append(str(ROOT / "packaging" / "rthook_cv2_macos.py"))
+
 excludes = [
     "torch", "torchvision", "torchaudio", "sam2", "tensorflow", "jax",
     "IPython", "jupyter", "notebook", "pytest", "tkinter",
@@ -98,6 +117,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     excludes=excludes,
+    runtime_hooks=runtime_hooks,
     noarchive=False,
     optimize=1,
 )
