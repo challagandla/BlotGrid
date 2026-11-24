@@ -1,5 +1,6 @@
 """Unit tests for the densitometry and normalization math."""
 import io
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -279,6 +280,27 @@ def test_project_round_trip_from_bytes():
              "control": "GAPDH", "bands_dark": True,
              "alignment_applied": {"blot1.tif": 0.0},
              "image_provenance": {"blot1.tif": {"sha256": "abc123"}},
+             "source_lineage": {
+                 "schema_version": 1,
+                 "info": {
+                     "title": "Public blot review",
+                     "source_dois": ["10.1234/example"],
+                 },
+                 "licenses": [{"id": 1, "spdx_identifier": "CC0-1.0"}],
+                 "sources": [
+                     {
+                         "id": "example",
+                         "doi": "10.1234/example",
+                         "license_id": 1,
+                     }
+                 ],
+                 "images": {
+                     "blot1.tif": {
+                         "source_id": "example",
+                         "upstream_path": "raw/blot1.tif",
+                     }
+                 },
+             },
              "evaluation_task": {
                  "schema_version": 1,
                  "task_id": "task-opaque",
@@ -292,8 +314,154 @@ def test_project_round_trip_from_bytes():
     assert back["layouts"]["blot1.tif"]["lane_x"] == [80, 180]
     assert back["alignment_applied"]["blot1.tif"] == 0.0
     assert back["image_provenance"]["blot1.tif"]["sha256"] == "abc123"
+    assert back["source_lineage"]["images"]["blot1.tif"] == {
+        "source_id": "example",
+        "upstream_path": "raw/blot1.tif",
+    }
     assert back["evaluation_task"]["task_id"] == "task-opaque"
     assert "_saved_at" in back
+
+
+def test_project_load_rejects_duplicate_lineage_keys():
+    duplicate = (
+        '{"source_lineage":{"schema_version":1,"schema_version":1},'
+        '"layouts":{}}'
+    )
+
+    with np.testing.assert_raises(ValueError):
+        project_io.load_project(duplicate)
+
+
+def test_project_json_rejects_nonfinite_values():
+    with np.testing.assert_raises(ValueError):
+        project_io.project_json({"source_lineage": {}, "value": float("nan")})
+
+
+def test_project_json_keeps_supported_scalar_types_typed():
+    payload = json.loads(
+        project_io.project_json(
+            {
+                "integer": np.int64(7),
+                "boolean": np.bool_(True),
+                "path": Path("models/detector.pt"),
+            }
+        )
+    )
+
+    assert payload["integer"] == 7
+    assert payload["boolean"] is True
+    assert payload["path"] == "models/detector.pt"
+
+
+def test_exact_hash_reupload_preserves_bound_image_provenance():
+    previous = {
+        "sha256": "a" * 64,
+        "width": 10,
+        "height": 20,
+        "bit_depth": 8,
+        "source_id": "public-source",
+        "upstream_path": "images/blot.tif",
+    }
+
+    exact = project_io.merged_image_provenance(
+        previous,
+        sha256="a" * 64,
+        width=30,
+        height=40,
+        bit_depth=16,
+    )
+    changed = project_io.merged_image_provenance(
+        previous,
+        sha256="b" * 64,
+        width=30,
+        height=40,
+        bit_depth=16,
+    )
+
+    assert exact["source_id"] == "public-source"
+    assert exact["upstream_path"] == "images/blot.tif"
+    assert (exact["width"], exact["height"], exact["bit_depth"]) == (30, 40, 16)
+    assert changed == {
+        "sha256": "b" * 64,
+        "width": 30,
+        "height": 40,
+        "bit_depth": 16,
+    }
+
+
+def test_whole_image_attestation_closes_proposal_review_gate():
+    layout = {
+        "annotation_complete": False,
+        "negative_image": False,
+        "rois": [
+            {
+                "use": True,
+                "annotation_approved": False,
+                "review_required": True,
+                "source": "gelgenie",
+            },
+            {
+                "use": False,
+                "annotation_approved": True,
+                "review_required": True,
+                "source": "gelgenie",
+            },
+        ],
+    }
+
+    has_active = project_io.attest_complete_annotations(layout)
+
+    assert has_active is True
+    assert layout["annotation_complete"] is True
+    assert layout["negative_image"] is False
+    assert layout["rois"][0]["annotation_approved"] is True
+    assert layout["rois"][0]["review_required"] is False
+    assert layout["rois"][1]["annotation_approved"] is False
+    assert layout["rois"][1]["review_required"] is True
+
+
+def test_whole_image_attestation_allows_reviewed_negative():
+    layout = {
+        "rois": [
+            {
+                "use": False,
+                "annotation_approved": False,
+                "review_required": True,
+            }
+        ]
+    }
+
+    has_active = project_io.attest_complete_annotations(layout)
+
+    assert has_active is False
+    assert layout["annotation_complete"] is True
+    assert layout["negative_image"] is True
+    assert layout["rois"][0]["annotation_approved"] is False
+    assert layout["rois"][0]["review_required"] is True
+
+
+def test_whole_image_attestation_rejects_malformed_rois_atomically():
+    first = {
+        "use": True,
+        "annotation_approved": False,
+        "review_required": True,
+    }
+    layout = {
+        "annotation_complete": False,
+        "negative_image": False,
+        "rois": [first, "malformed"],
+    }
+
+    with np.testing.assert_raises(ValueError):
+        project_io.attest_complete_annotations(layout)
+
+    assert first == {
+        "use": True,
+        "annotation_approved": False,
+        "review_required": True,
+    }
+    assert layout["annotation_complete"] is False
+    assert layout["negative_image"] is False
 
 
 def test_measurement_clips_original_rectangle_endpoints():

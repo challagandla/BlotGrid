@@ -61,6 +61,54 @@ class ExperimentLabels:
     blot_bounds: tuple[int, int] | None = None
     lane_centers: tuple[int, ...] = ()
     target_centers: tuple[int, ...] = ()
+    ladder_lanes: tuple[str, ...] = ()
+    autofill_ready: bool = True
+
+
+_RAW_GRID_AUTOFILL_MIN_CONFIDENCE = 0.18
+
+
+def _is_ladder_label(value: object) -> bool:
+    """Return whether one complete lane label explicitly denotes a ladder.
+
+    This intentionally uses whole-label matches. Short labels such as ``M`` and
+    ``L`` and condition names such as ``marker-treated`` are too ambiguous to
+    exclude from quantification automatically.
+    """
+    label = re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
+    compact = label.replace(" ", "")
+    if compact == "mw":
+        return True
+    return label in {
+        "marker",
+        "ladder",
+        "protein marker",
+        "protein ladder",
+        "molecular weight marker",
+        "molecular weight ladder",
+        "mw marker",
+        "mw ladder",
+    }
+
+
+def detected_ladder_lanes(lanes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Return explicit ladder/marker labels in their physical lane order."""
+    return tuple(str(lane) for lane in lanes if _is_ladder_label(lane))
+
+
+def can_autofill_metadata(labels: ExperimentLabels | None) -> bool:
+    """Return whether detected metadata is safe to apply without confirmation."""
+    if not isinstance(labels, ExperimentLabels):
+        return False
+    if not labels.autofill_ready or not labels.targets or not labels.lanes:
+        return False
+    ladder_names = set(labels.ladder_lanes)
+    if not any(lane not in ladder_names for lane in labels.lanes):
+        return False
+    if labels.lane_source == "raw_scan":
+        confidence = min(labels.target_confidence, labels.lane_confidence)
+        return confidence >= _RAW_GRID_AUTOFILL_MIN_CONFIDENCE
+    return True
 
 
 def _clean_label(value: object) -> str:
@@ -293,10 +341,13 @@ def classify_experiment_labels(
         lane_names = tuple(token.text for token in lane_tokens)
         lane_source = "printed"
         lane_confidence = float(np.mean([token.score for token in lane_tokens]))
+        inferred_centres = tuple(int(round(token.cx)) for token in lane_tokens)
+        blot_bounds = None
     elif combined_lane_words:
         lane_names = tuple(combined_lane_words)
         lane_source = "printed"
         lane_confidence = 0.65
+        inferred_centres, blot_bounds = (), None
     elif target_names:
         lane_count, inferred_centres, blot_bounds = _infer_lane_grid(gray, targets)
         lane_names = tuple(f"Lane {index}" for index in range(1, lane_count + 1))
@@ -308,8 +359,7 @@ def classify_experiment_labels(
         lane_confidence = 0.0
         inferred_centres, blot_bounds = (), None
 
-    if lane_tokens or combined_lane_words:
-        inferred_centres, blot_bounds = (), None
+    ladder_lanes = detected_ladder_lanes(lane_names)
 
     return ExperimentLabels(
         targets=target_names,
@@ -322,6 +372,8 @@ def classify_experiment_labels(
         blot_bounds=blot_bounds,
         lane_centers=inferred_centres,
         target_centers=tuple(int(round(token.cy)) for token in targets),
+        ladder_lanes=ladder_lanes,
+        autofill_ready=bool(target_names and lane_names),
     )
 
 
@@ -444,6 +496,8 @@ def infer_raw_scan_labels(
         blot_bounds=getattr(prior, "blot_bounds", None) if prior else None,
         lane_centers=lane_centers,
         target_centers=target_centers,
+        ladder_lanes=tuple(getattr(prior, "ladder_lanes", ())) if prior else (),
+        autofill_ready=grid.grid_confidence >= _RAW_GRID_AUTOFILL_MIN_CONFIDENCE,
     )
 
 

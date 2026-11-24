@@ -52,6 +52,15 @@ PUBLICATION_METADATA_SCHEMA_VERSION = 2
 MAX_CHECKPOINT_HISTORY = 500
 
 _PUBLICATION_LICENSE_POLICIES: dict[str, dict[str, Any]] = {
+    "CC0-1.0": {
+        "names": {
+            "Creative Commons Zero v1.0 Universal",
+        },
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution_required": False,
+        "share_alike_required": False,
+        "obligations": [],
+    },
     "CC-BY-4.0": {
         "names": {
             "Creative Commons Attribution 4.0",
@@ -3920,6 +3929,219 @@ def _write_working_image(
     return _sha256_file(destination)
 
 
+_PROJECT_LINEAGE_IMAGE_RESERVED_FIELDS = {
+    "license",
+    "mode",
+    "bands_dark",
+    "polarity_confidence",
+    "detection_warnings",
+    "replicate",
+    "study_group",
+    "original_sha256",
+    "provenance_verified",
+    "alignment_applied_degrees",
+    "exported_working_sha256",
+    "working_pixels_exported",
+    "annotation_complete",
+    "negative_image",
+}
+
+
+def _project_source_lineage(
+    payload: Mapping[str, Any],
+    layouts: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate optional project lineage without weakening legacy exports."""
+    raw = payload.get("source_lineage")
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, Mapping):
+        raise MLTrainingError("Project source_lineage must be an object.")
+    unexpected = set(raw) - {
+        "schema_version",
+        "info",
+        "licenses",
+        "sources",
+        "images",
+    }
+    if unexpected:
+        raise MLTrainingError(
+            "Project source_lineage contains unsupported field(s): "
+            + ", ".join(sorted(str(value) for value in unexpected))
+            + "."
+        )
+    schema_version = raw.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version != DATASET_LICENSE_LINEAGE_SCHEMA_VERSION
+    ):
+        raise MLTrainingError(
+            "Project source_lineage schema_version is not supported."
+        )
+
+    raw_info = raw.get("info", {})
+    if not isinstance(raw_info, Mapping):
+        raise MLTrainingError("Project source_lineage info must be an object.")
+    unsupported_info = set(raw_info) - {"title", "version", "source_dois"}
+    if unsupported_info:
+        raise MLTrainingError(
+            "Project source_lineage info contains unsupported field(s): "
+            + ", ".join(sorted(str(value) for value in unsupported_info))
+            + "."
+        )
+    info = _validated_json_copy(raw_info, label="Project source_lineage info")
+    source_dois = info.get("source_dois", [])
+    if not isinstance(source_dois, list) or any(
+        not isinstance(value, str) or not value.strip()
+        for value in source_dois
+    ):
+        raise MLTrainingError(
+            "Project source_lineage info.source_dois must be a list of "
+            "non-empty strings."
+        )
+    if len(set(source_dois)) != len(source_dois):
+        raise MLTrainingError(
+            "Project source_lineage info.source_dois contains duplicates."
+        )
+
+    raw_licenses = raw.get("licenses", [])
+    raw_sources = raw.get("sources", [])
+    raw_images = raw.get("images")
+    if not isinstance(raw_licenses, list):
+        raise MLTrainingError("Project source_lineage licenses must be a list.")
+    if not isinstance(raw_sources, list):
+        raise MLTrainingError("Project source_lineage sources must be a list.")
+    if not isinstance(raw_images, Mapping):
+        raise MLTrainingError("Project source_lineage images must be an object.")
+    licenses = _validated_json_copy(
+        raw_licenses, label="Project source_lineage licenses"
+    )
+    sources = _validated_json_copy(
+        raw_sources, label="Project source_lineage sources"
+    )
+
+    license_ids: set[int] = set()
+    for index, record in enumerate(licenses):
+        if not isinstance(record, dict) or type(record.get("id")) is not int:
+            raise MLTrainingError(
+                f"Project source_lineage licence {index} requires an integer id."
+            )
+        license_id = int(record["id"])
+        if license_id in license_ids:
+            raise MLTrainingError(
+                f"Duplicate project source_lineage licence id: {license_id}."
+            )
+        license_ids.add(license_id)
+
+    sources_by_id: dict[str, dict[str, Any]] = {}
+    for index, record in enumerate(sources):
+        if not isinstance(record, dict):
+            raise MLTrainingError(
+                f"Project source_lineage source {index} must be an object."
+            )
+        source_id = record.get("id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise MLTrainingError(
+                f"Project source_lineage source {index} requires a non-empty id."
+            )
+        source_id = source_id.strip()
+        if source_id in sources_by_id:
+            raise MLTrainingError(
+                f"Duplicate project source_lineage source id: {source_id!r}."
+            )
+        record["id"] = source_id
+        license_id = record.get("license_id")
+        if type(license_id) is not int or license_id not in license_ids:
+            raise MLTrainingError(
+                f"Project source_lineage source {source_id!r} must refer to a "
+                "declared integer licence id."
+            )
+        sources_by_id[source_id] = record
+
+    layout_names = {str(value) for value in layouts}
+    if any(not isinstance(value, str) for value in raw_images):
+        raise MLTrainingError(
+            "Project source_lineage image keys must be project filenames."
+        )
+    lineage_names = set(raw_images)
+    missing = sorted(layout_names - lineage_names)
+    extra = sorted(lineage_names - layout_names)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(repr(value) for value in missing))
+        if extra:
+            details.append("unknown " + ", ".join(repr(value) for value in extra))
+        raise MLTrainingError(
+            "Project source_lineage image mapping does not exactly match "
+            "project layouts (" + "; ".join(details) + ")."
+        )
+
+    images: dict[str, dict[str, Any]] = {}
+    for filename in sorted(layout_names):
+        raw_image = raw_images[filename]
+        if not isinstance(raw_image, Mapping):
+            raise MLTrainingError(
+                f"Project source_lineage image {filename!r} must be an object."
+            )
+        image = _validated_json_copy(
+            raw_image,
+            label=f"Project source_lineage image {filename!r}",
+        )
+        collisions = set(image) & _PROJECT_LINEAGE_IMAGE_RESERVED_FIELDS
+        if collisions:
+            raise MLTrainingError(
+                f"Project source_lineage image {filename!r} uses reserved "
+                "field(s): "
+                + ", ".join(sorted(collisions))
+                + "."
+            )
+        source_id = image.get("source_id")
+        if not isinstance(source_id, str) or source_id.strip() not in sources_by_id:
+            raise MLTrainingError(
+                f"Project source_lineage image {filename!r} must refer to a "
+                "declared source_id."
+            )
+        source_id = source_id.strip()
+        image["source_id"] = source_id
+        source = sources_by_id[source_id]
+        source_license_id = int(source["license_id"])
+        image_license_id = image.get("license_id", source_license_id)
+        if (
+            type(image_license_id) is not int
+            or image_license_id not in license_ids
+            or image_license_id != source_license_id
+        ):
+            raise MLTrainingError(
+                f"Project source_lineage image {filename!r} licence does not "
+                f"match source {source_id!r}."
+            )
+        image["license_id"] = image_license_id
+        for image_field, source_field in (
+            ("source_doi", "doi"),
+            ("source_url", "url"),
+            ("required_attribution", "required_attribution"),
+        ):
+            inherited = source.get(source_field)
+            direct = image.get(image_field)
+            if direct is not None and inherited is not None and direct != inherited:
+                raise MLTrainingError(
+                    f"Project source_lineage image {filename!r} {image_field} "
+                    f"conflicts with source {source_id!r}."
+                )
+            if direct is None and inherited is not None:
+                image[image_field] = inherited
+        images[filename] = image
+
+    return {
+        "schema_version": DATASET_LICENSE_LINEAGE_SCHEMA_VERSION,
+        "info": info,
+        "licenses": licenses,
+        "sources": sources,
+        "images": images,
+    }
+
+
 def export_project_to_coco(
     project: str | os.PathLike[str] | Mapping[str, Any],
     image_root: str | os.PathLike[str],
@@ -3938,6 +4160,7 @@ def export_project_to_coco(
     layouts = payload.get("layouts")
     if not isinstance(layouts, dict):
         raise MLTrainingError("BlotGrid project JSON has no 'layouts' object.")
+    source_lineage = _project_source_lineage(payload, layouts)
     root = Path(image_root).expanduser().resolve()
     output_path = Path(output).expanduser().resolve() if output is not None else None
     if output_path is not None and output_path.exists() and not force:
@@ -4012,7 +4235,9 @@ def export_project_to_coco(
             "source_project": source_name,
             "source_project_saved_at": payload.get("_saved_at"),
         },
-        "licenses": [],
+        "licenses": (
+            source_lineage["licenses"] if source_lineage is not None else []
+        ),
         "categories": [
             {"id": 1, "name": "band", "supercategory": "western_blot"}
         ],
@@ -4052,6 +4277,14 @@ def export_project_to_coco(
             "warnings": [],
         },
     }
+    if source_lineage is not None:
+        for field in ("title", "version", "source_dois"):
+            if field in source_lineage["info"]:
+                coco["info"][field] = source_lineage["info"][field]
+        coco["blotgrid"]["license_lineage_schema_version"] = (
+            DATASET_LICENSE_LINEAGE_SCHEMA_VERSION
+        )
+        coco["blotgrid"]["sources"] = source_lineage["sources"]
     annotation_id = 1
     skipped_inactive = skipped_fallback = skipped_unreviewed = 0
     skipped_invalid = review_count = pseudo_label_count = 0
@@ -4137,40 +4370,50 @@ def export_project_to_coco(
                 angle=angle,
                 force=force,
             )
+        lineage_image = (
+            dict(source_lineage["images"][str(filename)])
+            if source_lineage is not None
+            else {}
+        )
+        image_license_id = lineage_image.pop("license_id", None)
+        image_metadata = {
+            **lineage_image,
+            "mode": _safe_metadata(layout.get("mode")),
+            "bands_dark": _safe_metadata(layout.get("bands_dark")),
+            "polarity_confidence": _safe_metadata(
+                layout.get("polarity_confidence")
+            ),
+            "detection_warnings": _safe_metadata(
+                layout.get("detection_warnings", [])
+            ),
+            "replicate": _safe_metadata(
+                payload.get("replicate", {}).get(filename)
+                if isinstance(payload.get("replicate"), dict)
+                else None
+            ),
+            "study_group": _safe_metadata(
+                _project_image_value(study_groups, str(filename), None)
+            ),
+            "original_sha256": original_sha256,
+            "provenance_verified": bool(
+                isinstance(provenance, Mapping)
+                and provenance.get("sha256")
+            ),
+            "alignment_applied_degrees": angle,
+            "exported_working_sha256": exported_sha256,
+            "working_pixels_exported": exported_root is not None,
+            "annotation_complete": layout.get("annotation_complete") is True,
+            "negative_image": layout.get("negative_image") is True,
+        }
         image_record = {
             "id": image_id,
             "file_name": str(filename),
             "width": width,
             "height": height,
-            "blotgrid": {
-                "mode": _safe_metadata(layout.get("mode")),
-                "bands_dark": _safe_metadata(layout.get("bands_dark")),
-                "polarity_confidence": _safe_metadata(
-                    layout.get("polarity_confidence")
-                ),
-                "detection_warnings": _safe_metadata(
-                    layout.get("detection_warnings", [])
-                ),
-                "replicate": _safe_metadata(
-                    payload.get("replicate", {}).get(filename)
-                    if isinstance(payload.get("replicate"), dict)
-                    else None
-                ),
-                "study_group": _safe_metadata(
-                    _project_image_value(study_groups, str(filename), None)
-                ),
-                "original_sha256": original_sha256,
-                "provenance_verified": bool(
-                    isinstance(provenance, Mapping)
-                    and provenance.get("sha256")
-                ),
-                "alignment_applied_degrees": angle,
-                "exported_working_sha256": exported_sha256,
-                "working_pixels_exported": exported_root is not None,
-                "annotation_complete": layout.get("annotation_complete") is True,
-                "negative_image": layout.get("negative_image") is True,
-            },
+            "blotgrid": image_metadata,
         }
+        if image_license_id is not None:
+            image_record["license"] = image_license_id
         coco["images"].append(image_record)
         annotation_start = len(coco["annotations"])
         rois = layout.get("rois", [])
@@ -4305,6 +4548,18 @@ def export_project_to_coco(
             f"{pseudo_label_count} unapproved ROI(s) were included as pseudo-labels. "
             "Do not treat pseudo-label validation metrics as independent evidence."
         )
+
+    if source_lineage is not None:
+        validated_lineage = _extract_dataset_license_lineage(coco)
+        lineage_summary = validated_lineage["summary"]
+        if (
+            lineage_summary["images_without_declared_license"]
+            or lineage_summary["images_without_declared_source"]
+        ):
+            raise MLTrainingError(
+                "Project source_lineage did not resolve every exported image to "
+                "a declared source and licence."
+            )
 
     if output_path is not None:
         _atomic_json_write(output_path, coco)

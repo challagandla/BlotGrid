@@ -36,7 +36,7 @@ import streamlit as st
 from wblot import (alignment, detection, image_io, densitometry, normalization, stats,
                    plotting, project_io, roi_constraints, roi_editor,
                    gelgenie, holdout_evaluation, label_ocr, ml_detector,
-                   sam_refiner)
+                   lane_roles, sam_refiner)
 
 st.set_page_config(page_title="BlotGrid", page_icon="▦", layout="wide")
 
@@ -52,14 +52,18 @@ S.setdefault("layouts", {})      # name -> layout dict
 S.setdefault("replicate", {})    # name -> replicate int
 S.setdefault("study_group", {})  # name -> leakage-safe study/experiment group
 S.setdefault("annotation_complete", {})  # name -> whole-image human review
+S.setdefault("source_lineage", {})  # public source/licence metadata for training
 S.setdefault("evaluation_task", {})  # opaque blinded holdout task binding
 S.setdefault("upload_generation", 0)  # rotate uploader keys after restore/clear
 S.setdefault("targets", [])
 S.setdefault("control", "")
 S.setdefault("lanes", [])
+S.setdefault("ladder_lanes", [])  # physical lanes omitted from ROIs and measurements
 S.setdefault("label_scans", {})
 S.setdefault("metadata_autofill_done", False)
 S.setdefault("metadata_source", "")
+S.setdefault("metadata_quality", -1.0)
+S.setdefault("metadata_signature", None)
 S.setdefault("metadata_message", "Upload a labelled blot or raw scan to fill this setup automatically.")
 S.setdefault("bands_dark", True)
 S.setdefault("polarity_mode", "auto")
@@ -109,6 +113,7 @@ PROJECT_DEFAULTS = {
     "targets": [],
     "control": "",
     "lanes": [],
+    "ladder_lanes": [],
     "bands_dark": True,
     "polarity_mode": "auto",
     "detection_sensitivity": 0.65,
@@ -136,6 +141,10 @@ PROJECT_DEFAULTS = {
     "annotation_complete": {},
     "alignment_applied": {},
     "image_provenance": {},
+    # Optional public-training lineage. When present, the COCO exporter binds
+    # every image to one declared source and licence instead of emitting an
+    # anonymous dataset.
+    "source_lineage": {},
     # Opaque evaluator binding for imported blinded holdout tasks. The app does
     # not interpret it; save/restore preserves it for fail-closed scoring.
     "evaluation_task": {},
@@ -200,6 +209,8 @@ def _sanitize_restored_annotations() -> None:
                 roi.get("annotation_approved") is True
                 and roi["use"]
             )
+        if lane_roles.enforce_excluded_rois(layout, S.get("ladder_lanes", [])):
+            complete[image_name] = False
 
 
 def _invalidate_results() -> None:
@@ -421,6 +432,13 @@ def default_layout(img: image_io.LoadedImage, targets, n_lanes):
 
 def automatic_layout(img: image_io.LoadedImage, targets, lanes):
     """Detect polarity, lane/row positions, and all individual bands."""
+    selected_ladders = {str(value) for value in S.get("ladder_lanes", [])}
+    ladder_lanes = [str(lane) for lane in lanes if str(lane) in selected_ladders]
+    if not lane_roles.ordered_quantifiable_lanes(lanes, ladder_lanes):
+        raise ValueError(
+            "Every lane is marked as a ladder. Keep at least one sample lane "
+            "before detecting or quantifying bands."
+        )
     mode = S.get("polarity_mode", "auto")
     scan = S.get("label_scans", {}).get(img.name)
     lane_hint = None
@@ -496,12 +514,18 @@ def automatic_layout(img: image_io.LoadedImage, targets, lanes):
             sensitivity=S.get("detection_sensitivity", 0.65),
             lane_centers_hint=lane_hint,
             target_centers_hint=target_hint,
+            excluded_lanes=ladder_lanes,
         )
+    if backend != "classical" and ladder_lanes:
+        result.bands = [
+            band for band in result.bands if band.lane not in set(ladder_lanes)
+        ]
     directly_detected = len(result.bands)
     fallback_count = detection.ensure_complete_grid(
         result, targets, lanes, img.gray.shape,
         gray=img.gray,
         sensitivity=S.get("detection_sensitivity", 0.65),
+        excluded_lanes=ladder_lanes,
     )
     widths = [b.w for b in result.bands]
     roi_rows = [dict(b.as_row(), roi_id=f"roi_{index}",
@@ -533,6 +557,7 @@ def automatic_layout(img: image_io.LoadedImage, targets, lanes):
         "bands_dark": result.bands_are_dark,
         "polarity_confidence": result.polarity_confidence,
         "detection_warnings": result.warnings,
+        "excluded_lanes": list(ladder_lanes),
         "detected_count": len(result.bands),
         "directly_detected_count": directly_detected,
         "fallback_count": fallback_count,
@@ -540,15 +565,17 @@ def automatic_layout(img: image_io.LoadedImage, targets, lanes):
     }
 
 
-def rois_from_layout(layout, targets, lanes):
+def rois_from_layout(layout, targets, lanes, excluded_lanes=()):
     """Yield (target, lane, x, y, w, h) rectangles from layout parameters."""
+    excluded = {str(value) for value in excluded_lanes}
     if "rois" in layout:
         valid_targets, valid_lanes = set(targets), set(lanes)
         for roi in layout.get("rois", []):
             if not roi.get("use", True):
                 continue
             target, lane = roi.get("target"), roi.get("lane")
-            if target not in valid_targets or lane not in valid_lanes:
+            if (target not in valid_targets or lane not in valid_lanes
+                    or str(lane) in excluded):
                 continue
             try:
                 x, y, w, h = (int(roi[k]) for k in ("x", "y", "w", "h"))
@@ -565,6 +592,8 @@ def rois_from_layout(layout, targets, lanes):
         h = ty["h"]
         y = int(ty["y"] - h / 2)
         for lane, cx in zip(lanes, layout["lane_x"]):
+            if str(lane) in excluded:
+                continue
             x = int(cx - w / 2)
             yield t, lane, x, y, w, h
 
@@ -580,18 +609,38 @@ def _metadata_message(labels: label_ocr.ExperimentLabels) -> str:
         )
     else:
         lane_text = f"no printed lane names; inferred {len(labels.lanes)} band columns"
-    return f"Read from image — targets: {target_text}; {lane_text}."
+    ladder_lanes = tuple(getattr(labels, "ladder_lanes", ()))
+    ladder_text = (
+        f" Protein ladder omitted: {', '.join(ladder_lanes)}."
+        if ladder_lanes else ""
+    )
+    return f"Read from image — targets: {target_text}; {lane_text}.{ladder_text}"
+
+
+def _metadata_quality(labels: label_ocr.ExperimentLabels) -> float:
+    """Rank complete metadata so printed labels beat neutral raw-grid guesses."""
+    source_rank = {"printed": 3.0, "inferred": 2.0, "raw_scan": 1.0}
+    confidence = float(np.clip(labels.target_confidence, 0.0, 1.0))
+    if labels.lane_source == "printed":
+        confidence = min(confidence, float(np.clip(labels.lane_confidence, 0.0, 1.0)))
+    return source_rank.get(labels.lane_source, 0.0) + confidence
 
 
 def _queue_detected_metadata(labels: label_ocr.ExperimentLabels, image_name: str) -> None:
     """Stage OCR values so keyed sidebar widgets receive them before rendering."""
     targets = list(labels.targets)
     lanes = list(labels.lanes)
+    ladder_lanes = [
+        lane for lane in getattr(labels, "ladder_lanes", ()) if lane in lanes
+    ]
     S["_pending_metadata"] = {
         "targets": targets,
         "lanes": lanes,
+        "ladder_lanes": ladder_lanes,
         "control": label_ocr.suggested_control(targets),
         "source": image_name,
+        "quality": _metadata_quality(labels),
+        "signature": (tuple(targets), tuple(lanes), tuple(ladder_lanes)),
         "message": _metadata_message(labels),
     }
     S["metadata_autofill_done"] = True
@@ -611,11 +660,21 @@ pending_metadata = S.pop("_pending_metadata", None)
 if pending_metadata:
     S["targets"] = list(pending_metadata.get("targets", []))
     S["lanes"] = list(pending_metadata.get("lanes", []))
+    S["ladder_lanes"] = [
+        lane for lane in pending_metadata.get("ladder_lanes", [])
+        if lane in S["lanes"]
+    ]
     S["control"] = str(pending_metadata.get("control", ""))
     S["targets_input"] = "\n".join(S["targets"])
     S["lanes_input"] = "\n".join(S["lanes"])
+    S["ladder_lanes_select"] = list(S["ladder_lanes"])
     S["control_select"] = S["control"] or NO_CONTROL_OPTION
     S["metadata_source"] = str(pending_metadata.get("source", ""))
+    S["metadata_quality"] = float(pending_metadata.get("quality", -1.0))
+    S["metadata_signature"] = pending_metadata.get(
+        "signature",
+        (tuple(S["targets"]), tuple(S["lanes"]), tuple(S["ladder_lanes"])),
+    )
     S["metadata_message"] = str(pending_metadata.get("message", ""))
 
 S.setdefault("targets_input", "\n".join(S["targets"]))
@@ -624,6 +683,26 @@ S.setdefault("lanes_input", "\n".join(S["lanes"]))
 # the previous Streamlit event before dependent controls are created.
 S["targets"] = [line.strip() for line in S["targets_input"].splitlines() if line.strip()]
 S["lanes"] = [line.strip() for line in S["lanes_input"].splitlines() if line.strip()]
+stored_ladders = S.get("ladder_lanes_select", S.get("ladder_lanes", []))
+if not isinstance(stored_ladders, (list, tuple, set)):
+    stored_ladders = []
+selected_ladders = [
+    lane for lane in S["lanes"] if lane in {str(value) for value in stored_ladders}
+]
+lane_options_signature = tuple(S["lanes"])
+previous_lane_options = S.get("_ladder_lane_options_signature")
+if previous_lane_options != lane_options_signature:
+    previous_names = set(previous_lane_options or ())
+    newly_recognized = {
+        lane for lane in label_ocr.detected_ladder_lanes(S["lanes"])
+        if lane not in previous_names
+    }
+    selected_ladders.extend(
+        lane for lane in S["lanes"]
+        if lane in newly_recognized and lane not in selected_ladders
+    )
+S["ladder_lanes_select"] = selected_ladders
+S["_ladder_lane_options_signature"] = lane_options_signature
 
 
 # ----------------------------------------------------------------------------
@@ -655,6 +734,65 @@ with st.sidebar:
         key="lanes_input", placeholder="Read from labels, or inferred as Lane 1, Lane 2, …",
         disabled=evaluation_task_locked)
     S["lanes"] = [line.strip() for line in lane_text.splitlines() if line.strip()]
+    previous_ladders = tuple(S.get("ladder_lanes", []))
+    ladder_selection = st.multiselect(
+        "Ladder / marker lanes (excluded from quantification)",
+        S["lanes"],
+        key="ladder_lanes_select",
+        help=(
+            "Printed labels such as Ladder, Marker, or MW are selected locally. "
+            "The physical lane stays in left-to-right geometry, but BlotGrid "
+            "creates no measurement for it. Review this selection before quantifying."
+        ),
+        disabled=evaluation_task_locked,
+    )
+    S["ladder_lanes"] = [
+        lane for lane in S["lanes"] if lane in set(ladder_selection)
+    ]
+    if tuple(S["ladder_lanes"]) != previous_ladders:
+        for blot_name in list(S.get("blots", {})):
+            _clear_roi_widget_state(str(blot_name))
+            _invalidate_annotation_review(str(blot_name))
+        S["layouts"] = {}
+        _invalidate_results()
+        S["metadata_source"] = "manual"
+        S["metadata_quality"] = float("inf")
+        S["metadata_signature"] = (
+            tuple(S["targets"]), tuple(S["lanes"]), tuple(S["ladder_lanes"])
+        )
+    quant_lanes = lane_roles.ordered_quantifiable_lanes(
+        S["lanes"], S["ladder_lanes"])
+    if S["lanes"] and not quant_lanes:
+        st.error("Every lane is marked as a ladder. Keep at least one sample lane.")
+    elif S["ladder_lanes"]:
+        st.caption(
+            "Omitted from ROIs, densitometry, normalization, statistics, plots, "
+            f"and data export: {', '.join(S['ladder_lanes'])}."
+        )
+    current_metadata_signature = (
+        tuple(S["targets"]), tuple(S["lanes"]), tuple(S["ladder_lanes"])
+    )
+    if (S.get("metadata_signature") is None
+            and (S["targets"] or S["lanes"])
+            and pending_metadata is None):
+        S["metadata_autofill_done"] = True
+        S["metadata_source"] = "manual"
+        S["metadata_quality"] = float("inf")
+        S["metadata_signature"] = current_metadata_signature
+        S["metadata_message"] = (
+            "Experiment labels were entered manually; image suggestions will not "
+            "overwrite them."
+        )
+    elif (S.get("metadata_signature") is not None
+            and current_metadata_signature != tuple(S["metadata_signature"])
+            and S.get("metadata_source") != "manual"):
+        S["metadata_source"] = "manual"
+        S["metadata_quality"] = float("inf")
+        S["metadata_signature"] = current_metadata_signature
+        S["metadata_message"] = (
+            "Experiment labels were edited manually; image suggestions will not "
+            "overwrite them."
+        )
     st.caption(S.get("metadata_message", ""))
 
     st.divider()
@@ -927,6 +1065,7 @@ with st.sidebar:
     roi_identity_signature = (
         tuple(S["targets"]),
         tuple(S["lanes"]),
+        tuple(S["ladder_lanes"]),
     )
     previous_roi_identity = S.get("_roi_identity_signature")
     if (previous_roi_identity is not None
@@ -941,6 +1080,7 @@ with st.sidebar:
     quantification_signature = (
         tuple(S["targets"]),
         tuple(S["lanes"]),
+        tuple(S["ladder_lanes"]),
         S["control"],
         S["polarity_mode"],
         bool(S["bands_dark"]),
@@ -967,6 +1107,13 @@ with st.sidebar:
     if proj is not None and st.button("Restore project"):
         data = project_io.load_project(proj.getvalue())
         restored_task = data.get("evaluation_task", {})
+        restored_source_lineage = data.get("source_lineage", {})
+        if (
+            restored_source_lineage is not None
+            and not isinstance(restored_source_lineage, dict)
+        ):
+            st.error("The saved project source_lineage must be a JSON object.")
+            st.stop()
         if restored_task:
             restored_layouts = data.get("layouts")
             if not isinstance(restored_task, dict) or not isinstance(
@@ -991,9 +1138,16 @@ with st.sidebar:
             S[key] = copy.deepcopy(default if value is None else value)
         for key in ("layouts", "replicate", "study_group",
                     "annotation_complete", "alignment_applied",
-                    "image_provenance"):
+                    "image_provenance", "source_lineage"):
             if not isinstance(S.get(key), dict):
                 S[key] = {}
+        restored_ladders = S.get("ladder_lanes", [])
+        if not isinstance(restored_ladders, (list, tuple, set)):
+            restored_ladders = []
+        restored_ladder_set = {str(value) for value in restored_ladders}
+        S["ladder_lanes"] = [
+            lane for lane in S.get("lanes", []) if lane in restored_ladder_set
+        ]
         _sanitize_restored_annotations()
         S.pop("_roi_identity_signature", None)
         S.pop("_quantification_signature", None)
@@ -1012,8 +1166,14 @@ with st.sidebar:
         S["_pending_metadata"] = {
             "targets": restored_targets,
             "lanes": restored_lanes,
+            "ladder_lanes": list(S.get("ladder_lanes", [])),
             "control": S.get("control", label_ocr.suggested_control(restored_targets)),
             "source": "saved project",
+            "quality": float("inf"),
+            "signature": (
+                tuple(restored_targets), tuple(restored_lanes),
+                tuple(S.get("ladder_lanes", [])),
+            ),
             "message": "Experiment labels restored from the saved project.",
         }
         S["metadata_autofill_done"] = True
@@ -1046,6 +1206,7 @@ with tabs[0]:
                            key=f"blot_upload_{int(S['upload_generation'])}")
     if ups:
         metadata_rerun = False
+        autofill_candidates: list[tuple[float, str, label_ocr.ExperimentLabels]] = []
         seen_upload_names: dict[str, str] = {}
         for i, up in enumerate(ups):
             name = up.name
@@ -1074,6 +1235,14 @@ with tabs[0]:
                 S["alignment_applied"][name] = 0.0
                 S["replicate"].pop(name, None)
                 S["study_group"].pop(name, None)
+                source_lineage = S.get("source_lineage")
+                source_images = (
+                    source_lineage.get("images", {})
+                    if isinstance(source_lineage, dict)
+                    else {}
+                )
+                if isinstance(source_images, dict):
+                    source_images.pop(name, None)
                 _clear_roi_widget_state(name)
                 _invalidate_annotation_review(name)
                 _invalidate_results()
@@ -1099,9 +1268,25 @@ with tabs[0]:
                 S["study_group"].pop(name, None)
                 S["annotation_complete"].pop(name, None)
                 S["alignment_applied"][name] = 0.0
+                source_lineage = S.get("source_lineage")
+                source_images = (
+                    source_lineage.get("images", {})
+                    if isinstance(source_lineage, dict)
+                    else {}
+                )
+                if isinstance(source_images, dict):
+                    source_images.pop(name, None)
                 _clear_roi_widget_state(name)
                 _invalidate_annotation_review(name)
                 _invalidate_results()
+                if S.get("metadata_source") == name:
+                    S["metadata_autofill_done"] = False
+                    S["metadata_source"] = ""
+                    S["metadata_quality"] = -1.0
+                    S["metadata_signature"] = (
+                        tuple(S.get("targets", [])), tuple(S.get("lanes", [])),
+                        tuple(S.get("ladder_lanes", [])),
+                    )
                 st.warning(
                     f"{name} was replaced by different image bytes. Its old ROIs, "
                     "alignment, replicate/study assignment, and derived results "
@@ -1147,12 +1332,15 @@ with tabs[0]:
                     if abs(restored_angle) > 1e-12 else uploaded_image
                 )
                 S["alignment_applied"][name] = restored_angle
-                S["image_provenance"][name] = {
-                    "sha256": upload_sha,
-                    "width": uploaded_image.width,
-                    "height": uploaded_image.height,
-                    "bit_depth": uploaded_image.bit_depth,
-                }
+                S["image_provenance"][name] = (
+                    project_io.merged_image_provenance(
+                        previous_provenance,
+                        sha256=upload_sha,
+                        width=uploaded_image.width,
+                        height=uploaded_image.height,
+                        bit_depth=uploaded_image.bit_depth,
+                    )
+                )
                 _invalidate_results()
                 S["replicate"].setdefault(name, len(S["replicate"]) + 1)
                 S["study_group"].setdefault(name, "")
@@ -1177,7 +1365,9 @@ with tabs[0]:
             if (not evaluation_task_locked
                     and isinstance(scan, label_ocr.ExperimentLabels)
                     and (not hasattr(scan, "lane_centers")
-                         or not hasattr(scan, "target_centers"))):
+                         or not hasattr(scan, "target_centers")
+                         or not hasattr(scan, "ladder_lanes")
+                         or not hasattr(scan, "autofill_ready"))):
                 try:
                     with st.spinner(f"Updating local label analysis for {name}..."):
                         scan = label_ocr.read_experiment_labels_or_grid(S["blots"][name])
@@ -1191,17 +1381,25 @@ with tabs[0]:
             inferred_lane_upgrade = (
                 isinstance(scan, label_ocr.ExperimentLabels)
                 and scan.lane_source == "inferred"
+                and S.get("metadata_source") not in {"manual", "saved project"}
                 and tuple(S.get("targets", [])) == scan.targets
                 and current_lanes_are_generic
                 and len(scan.lanes) > len(S.get("lanes", []))
             )
-            if (not evaluation_task_locked
-                    and (not S.get("metadata_autofill_done") or inferred_lane_upgrade)
+            current_metadata_can_upgrade = (
+                not S.get("metadata_autofill_done")
+                or inferred_lane_upgrade
+                or (
+                    S.get("metadata_source") not in {"manual", "saved project"}
                     and isinstance(scan, label_ocr.ExperimentLabels)
-                    and scan.targets and scan.lanes):
-                _queue_detected_metadata(scan, name)
-                metadata_rerun = True
-                break
+                    and _metadata_quality(scan) > float(S.get("metadata_quality", -1.0))
+                )
+            )
+            if (not evaluation_task_locked
+                    and current_metadata_can_upgrade
+                    and isinstance(scan, label_ocr.ExperimentLabels)
+                    and label_ocr.can_autofill_metadata(scan)):
+                autofill_candidates.append((_metadata_quality(scan), name, scan))
 
             # A restored project's layout survives image re-upload. New images
             # and layouts reset by OCR are detected with the current metadata.
@@ -1223,6 +1421,12 @@ with tabs[0]:
                 else:
                     S["layouts"][name] = default_layout(
                         S["blots"][name], S["targets"], len(S["lanes"]))
+
+        if autofill_candidates:
+            _, source_name, best_scan = max(
+                autofill_candidates, key=lambda item: (item[0], item[1]))
+            _queue_detected_metadata(best_scan, source_name)
+            metadata_rerun = True
 
         if metadata_rerun:
             st.rerun()
@@ -1332,6 +1536,16 @@ with tabs[0]:
                             st.caption(
                                 f"Text recognition ({confidence}%): "
                                 f"{', '.join(scan.targets)} · {lane_note}")
+                        if scan.ladder_lanes:
+                            st.caption(
+                                "Detected ladder/marker lane(s), excluded when applied: "
+                                f"{', '.join(scan.ladder_lanes)}."
+                            )
+                        if not label_ocr.can_autofill_metadata(scan):
+                            st.warning(
+                                "This grid is low confidence and was not applied "
+                                "automatically. Check the proposed counts before using it."
+                            )
                         if st.button(
                             "Apply these labels",
                             key=f"apply_labels_{name}",
@@ -1350,7 +1564,7 @@ with tabs[0]:
             for k in ("blots", "original_blots", "alignment_applied",
                       "image_provenance", "layouts",
                       "replicate", "study_group", "annotation_complete",
-                      "label_scans"):
+                      "label_scans", "source_lineage"):
                 S[k] = {}
             S["evaluation_task"] = {}
             S["upload_generation"] = int(S.get("upload_generation", 0)) + 1
@@ -1358,6 +1572,11 @@ with tabs[0]:
             _invalidate_results()
             S["metadata_autofill_done"] = False
             S["metadata_source"] = ""
+            S["metadata_quality"] = -1.0
+            S["metadata_signature"] = (
+                tuple(S.get("targets", [])), tuple(S.get("lanes", [])),
+                tuple(S.get("ladder_lanes", [])),
+            )
             S["metadata_message"] = "Upload a labelled blot or raw scan to fill this setup automatically."
             st.rerun()
     else:
@@ -1369,8 +1588,8 @@ with tabs[0]:
 with tabs[1]:
     if not S["blots"]:
         st.info("Upload a blot first.")
-    elif not S["targets"] or not S["lanes"]:
-        st.error("Add at least one target and one lane in Experiment setup.")
+    elif not S["targets"] or not quant_lanes:
+        st.error("Add at least one target and one non-ladder sample lane in Experiment setup.")
     else:
         name = st.selectbox("Blot to lay out", list(S["blots"].keys()))
         if evaluation_task_locked and name not in S["layouts"]:
@@ -1381,6 +1600,9 @@ with tabs[1]:
             st.stop()
         img = S["blots"][name]
         layout = S["layouts"].setdefault(name, default_layout(img, S["targets"], len(S["lanes"])))
+        if lane_roles.enforce_excluded_rois(layout, S["ladder_lanes"]):
+            _invalidate_annotation_review(name)
+            _invalidate_results()
         detect_col, fallback_col, status_col = st.columns([1.1, 1.0, 2.2])
         if detect_col.button(
             "Detect all bands",
@@ -1533,7 +1755,7 @@ with tabs[1]:
                     manual_target = add_columns[0].selectbox(
                         "Target", S["targets"], key=f"manual_target_{name}")
                     manual_lane = add_columns[1].selectbox(
-                        "Lane", S["lanes"], key=f"manual_lane_{name}")
+                        "Lane", quant_lanes, key=f"manual_lane_{name}")
                     manual_count = add_columns[2].number_input(
                         "Boxes", 1, 20, 1, 1, key=f"manual_count_{name}")
                     if st.button(
@@ -1632,7 +1854,7 @@ with tabs[1]:
                         "target": st.column_config.SelectboxColumn(
                             "Target", options=S["targets"], required=True),
                         "lane": st.column_config.SelectboxColumn(
-                            "Lane", options=S["lanes"], required=True),
+                            "Lane", options=quant_lanes, required=True),
                         "x": st.column_config.NumberColumn("X", min_value=0, max_value=img.width - 1, step=1),
                         "y": st.column_config.NumberColumn("Y", min_value=0, max_value=img.height - 1, step=1),
                         "w": st.column_config.NumberColumn(
@@ -1667,16 +1889,7 @@ with tabs[1]:
                             or not study_group_present
                         ),
                         key=f"approve_all_rois_{name}"):
-                    for roi in layout["rois"]:
-                        roi["annotation_approved"] = _literal_checkbox(
-                            roi.get("use", True)
-                        )
-                    has_active_roi = any(
-                        _literal_checkbox(roi.get("use", True))
-                        for roi in layout["rois"]
-                    )
-                    layout["annotation_complete"] = True
-                    layout["negative_image"] = not has_active_roi
+                    project_io.attest_complete_annotations(layout)
                     S.setdefault("annotation_complete", {})[name] = True
                     S.pop(f"roi_table_{name}", None)
                     st.rerun()
@@ -1769,7 +1982,8 @@ with tabs[1]:
             ]
             cleaned_rois = []
             for record in edited.to_dict(orient="records"):
-                if record.get("target") not in S["targets"] or record.get("lane") not in S["lanes"]:
+                if (record.get("target") not in S["targets"]
+                        or record.get("lane") not in quant_lanes):
                     continue
                 try:
                     x, y = (int(record[k]) for k in ("x", "y"))
@@ -1938,7 +2152,8 @@ with tabs[1]:
             # use the interactive on-image editor above.
             fig, ax = plt.subplots(figsize=(6, 5))
             ax.imshow(image_io.to_display(img), cmap="gray")
-            for t, lane, x, y, w, h in rois_from_layout(layout, S["targets"], S["lanes"]):
+            for t, lane, x, y, w, h in rois_from_layout(
+                    layout, S["targets"], S["lanes"], S["ladder_lanes"]):
                 color = "red" if t == S["control"] else "yellow"
                 ax.add_patch(Rectangle((x, y), w, h, fill=False, edgecolor=color, lw=1.2))
                 ax.text(x, y - 2, f"{t[:6]}·{lane[:4]}", color=color, fontsize=6)
@@ -1953,6 +2168,8 @@ with tabs[1]:
 with tabs[2]:
     if not S["blots"]:
         st.info("Upload a blot first.")
+    elif not quant_lanes:
+        st.error("No sample lanes are available; unmark at least one ladder lane.")
     elif st.button("Run densitometry on all blots", type="primary"):
         rows = []
         for name, img in S["blots"].items():
@@ -1960,7 +2177,8 @@ with tabs[2]:
             bands_dark = layout.get("bands_dark", S["bands_dark"])
             sig = image_io.to_signal(img, bands_dark)
             bg_image = densitometry.rolling_ball_background(sig, S["rb_radius"]) if S["bg_method"] == "rolling_ball" else None
-            for t, lane, x, y, w, h in rois_from_layout(layout, S["targets"], S["lanes"]):
+            for t, lane, x, y, w, h in rois_from_layout(
+                    layout, S["targets"], S["lanes"], S["ladder_lanes"]):
                 m = densitometry.measure_band(
                     sig, t, lane, x, y, w, h,
                     method=S["bg_method"], margin=S["bg_margin"],
@@ -1973,11 +2191,16 @@ with tabs[2]:
                 row["replicate"] = S["replicate"].get(name, 1)
                 rows.append(row)
         S["measurements"] = pd.DataFrame(rows)
+        if rows:
+            S["measurements"] = lane_roles.filter_lane_rows(
+                S["measurements"], S["ladder_lanes"])
         if not rows:
             st.warning("No active band boxes were available. Detect bands or add a box in the ROIs tab.")
 
     if S["measurements"] is not None and not S["measurements"].empty:
-        df = S["measurements"]
+        df = lane_roles.filter_lane_rows(
+            S["measurements"], S["ladder_lanes"])
+        S["measurements"] = df
         st.dataframe(df[["blot", "replicate", "target", "lane", "measurement_mode",
                          "profile_y0", "profile_y1", "raw_intden",
                          "background_per_px", "net_intden", "saturated"]],
@@ -1992,15 +2215,17 @@ with tabs[2]:
 # Tab 4 — Normalize
 # ----------------------------------------------------------------------------
 with tabs[3]:
-    if S["measurements"] is None or S["measurements"].empty:
+    measurements = lane_roles.filter_lane_rows(
+        S["measurements"], S["ladder_lanes"])
+    if measurements is None or measurements.empty:
         st.info("Run Quantify first.")
-    elif not normalization.has_usable_control(S["measurements"], S["control"]):
+    elif not normalization.has_usable_control(measurements, S["control"]):
         S["normalized"] = None
         S["analysis_values"] = None
         S["normalization_applied"] = False
         parts = []
         try:
-            for name, group in S["measurements"].groupby("blot"):
+            for name, group in measurements.groupby("blot"):
                 intensity = normalization.prepare_intensities(
                     group, value_col="net_intden", multiband=S["multiband"])
                 intensity["blot"] = name
@@ -2037,10 +2262,10 @@ with tabs[3]:
         S["analysis_values"] = None
         S["normalization_applied"] = False
         do_fc = st.checkbox("Also express as fold-change vs a reference lane")
-        ref_lane = st.selectbox("Reference lane", S["lanes"]) if do_fc else None
+        ref_lane = st.selectbox("Reference lane", quant_lanes) if do_fc else None
         parts = []
         try:
-            for name, g in S["measurements"].groupby("blot"):
+            for name, g in measurements.groupby("blot"):
                 norm = normalization.normalize_to_control(
                     g, S["control"], value_col="net_intden", multiband=S["multiband"])
                 if do_fc:
@@ -2072,7 +2297,8 @@ with tabs[4]:
     if S.get("analysis_values") is None:
         st.info("Run Quantify first, then prepare the results in Normalize.")
     else:
-        nd = S["analysis_values"].copy()
+        nd = lane_roles.filter_lane_rows(
+            S["analysis_values"], S["ladder_lanes"])
         nd["condition"] = nd["lane"]  # lane label IS the shared condition across replicates
         vcol = S.get(
             "value_col",
@@ -2104,7 +2330,8 @@ with tabs[5]:
     if S.get("summary") is None:
         st.info("Run Replicates first.")
     else:
-        summary = S["summary"]
+        summary = lane_roles.filter_lane_rows(
+            S["summary"], S["ladder_lanes"], lane_col="condition")
         vcol = S.get(
             "value_col",
             "normalized" if S.get("normalization_applied") else "net_intden",
@@ -2112,7 +2339,7 @@ with tabs[5]:
         target_opts = [t for t in S["targets"] if t != S["control"]] or S["targets"]
         tgt = st.selectbox("Target to plot", target_opts)
         sub = summary[summary["target"] == tgt].copy()
-        raw = S["agg_raw"]
+        raw = lane_roles.filter_lane_rows(S["agg_raw"], S["ladder_lanes"])
         raw_pts = raw[raw["target"] == tgt][["condition", vcol]].rename(columns={vcol: "value"})
         if sub.empty or sub["mean"].isna().all():
             suffix = " and the loading control" if S.get("normalization_applied") else ""
@@ -2159,7 +2386,7 @@ with tabs[5]:
                 ymax = st.number_input("Y max", value=float(np.nanmax(sub["mean"]) * 1.4))
                 o.ylim = (0, ymax)
 
-        fig = plotting.bar_chart(sub, o, raw_points=raw_pts, order=S["lanes"],
+        fig = plotting.bar_chart(sub, o, raw_points=raw_pts, order=quant_lanes,
                                  value_col="mean")
         with right:
             st.pyplot(fig)
@@ -2184,11 +2411,14 @@ with tabs[5]:
 
         export_tables = {"summary": summary}
         if S["normalized"] is not None:
-            export_tables["normalized"] = S["normalized"]
+            export_tables["normalized"] = lane_roles.filter_lane_rows(
+                S["normalized"], S["ladder_lanes"])
         else:
-            export_tables["intensity_values"] = S["analysis_values"]
+            export_tables["intensity_values"] = lane_roles.filter_lane_rows(
+                S["analysis_values"], S["ladder_lanes"])
         if S["measurements"] is not None:
-            export_tables["raw_densitometry"] = S["measurements"]
+            export_tables["raw_densitometry"] = lane_roles.filter_lane_rows(
+                S["measurements"], S["ladder_lanes"])
         xbuf = io.BytesIO(dataframes_to_xlsx(export_tables))
         dc[1].download_button("All data XLSX", xbuf.getvalue(),
                               file_name="western_blot_data.xlsx",
