@@ -17,7 +17,58 @@ aggregate replicates, and export publication-quality bar charts.
 
 ![BlotGrid workflow](docs/blotgrid-workflow.svg)
 
-## Ubuntu install & run
+## Desktop app (Windows, macOS, Ubuntu)
+
+Download the archive for your system from the
+[Releases](https://github.com/challagandla/BlotGrid/releases) page, unpack it
+and open **BlotGrid**. You don't need Python.
+
+| System | Open | First launch |
+|---|---|---|
+| Windows 10/11 | `BlotGrid\BlotGrid.exe` | SmartScreen may warn about an unsigned app: **More info → Run anyway**. |
+| macOS 11+ (Apple silicon) | `BlotGrid.app` | Right-click → **Open** once (unsigned app), or run `xattr -dr com.apple.quarantine BlotGrid.app`. |
+| Ubuntu 22.04+ | `BlotGrid/BlotGrid` | Opens in a Chrome/Chromium/Edge app window if one is installed, otherwise in your default browser. |
+
+How the desktop app keeps your data safe:
+
+- The analysis server listens on `127.0.0.1` only, on a random port, so it is never reachable from the network.
+- Each launch creates a random access token, and a browser tab without it can't run the app.
+- XSRF protection stays on. Usage statistics, file watching and static file serving are off.
+- There are no web fonts, CDNs or downloads at runtime.
+- Closing the window stops the server.
+- Your models, runs and data go to a per-user folder instead of the app folder:
+  - Windows: `%LOCALAPPDATA%\BlotGrid`
+  - macOS: `~/Library/Application Support/BlotGrid`
+  - Linux: `~/.local/share/blotgrid`
+  - Set `BLOTGRID_HOME` to use another folder. Pretrained models go in its `models/` subfolder.
+- The server log is in the cache folder (`blotgrid-server.log`).
+
+The desktop bundle includes classical detection, GelGenie ONNX and label OCR.
+The optional PyTorch detector and SAM 2 refiner need a source install (below).
+
+Run the desktop launcher from a checkout, or build the bundle yourself:
+
+```bash
+pip install -r requirements-desktop.txt
+python blotgrid_desktop.py              # native window (Windows/macOS), app window on Linux
+python blotgrid_desktop.py --browser    # force a browser window
+
+pip install -r requirements-build.txt
+pip uninstall -y opencv-python && pip install opencv-python-headless==<same version>
+pyinstaller packaging/blotgrid.spec --noconfirm   # -> dist/BlotGrid or dist/BlotGrid.app
+python packaging/smoke_test.py dist/BlotGrid/BlotGrid
+```
+
+When you push a `v*` tag, `.github/workflows/desktop.yml` builds and smoke-tests
+all three platforms. It then drafts a release with the archives and `SHA256SUMS.txt`.
+
+The interface uses the Linear design language from
+[awesome-design-md](https://github.com/VoltAgent/awesome-design-md): a
+near-black canvas, charcoal surfaces with hairline borders and one lavender
+accent. Spacing follows the [OpenUI](https://github.com/thesysdev/openui)
+4 px token scale. Switch between light and dark in the app menu (⋮ → Settings).
+
+## Ubuntu install & run (from source)
 
 ```bash
 sudo apt update
@@ -336,6 +387,8 @@ measurement precision, not biological replication.
 
 ```
 app.py                 Streamlit UI (6 tabs)
+blotgrid_desktop.py    cross-platform desktop launcher (native window, local-only server)
+.streamlit/config.toml local-only server settings and Linear light/dark theme
 wblot/
   image_io.py          load images, signal polarity, saturation
   detection.py         automatic polarity, lanes, target rows and band rectangles
@@ -351,6 +404,13 @@ wblot/
   gelgenie.py          verified pretrained ONNX segmentation-to-ROI adapter
   sam_refiner.py       optional fixed-size ROI recentering with SAM 2.1
   composite.py         multi-tile figures: tiles, band split/extent, shared boxes
+  paths.py             per-platform user data/cache folders (frozen vs checkout)
+  desktop_guard.py     per-launch access token for the desktop server
+  ui_theme.py          Linear-style CSS on top of the Streamlit theme
+packaging/
+  blotgrid.spec        PyInstaller bundle for Windows, macOS and Linux
+  smoke_test.py        headless check of a built bundle
+  make_icon.py         renders packaging/icon.png
 scripts/
   setup_ubuntu.sh      creates the Ubuntu environment (optional CPU/CUDA ML)
   download_pretrained_models.py
@@ -375,6 +435,7 @@ test_composite.py      composite tiles: split, dumbbell/comet bands, shared boxe
 test_checkpoint_release.py checkpoint/sidecar release-binding tests
 test_holdout_evaluation.py sealed comparison and native-pixel metric tests
 test_holdout_security.py evaluator privacy and aggregation security tests
+test_desktop.py        desktop launcher, paths, access token, ROI image cache
 ```
 
 ## Tests

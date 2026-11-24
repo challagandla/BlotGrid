@@ -1,0 +1,5 @@
+# Pinned build tooling for the desktop bundles (packaging/blotgrid.spec).
+-r requirements-desktop.txt
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+pytest>=8,<9

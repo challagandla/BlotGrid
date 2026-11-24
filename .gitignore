@@ -4,6 +4,11 @@ __pycache__/
 .cache/
 .vendor/
 .*
+# Shipped configuration: Streamlit theme/server settings and CI workflows.
+!.streamlit/
+.streamlit/*
+!.streamlit/config.toml
+!.github/
 !.gitignore
 smoke_plot.png
 models/

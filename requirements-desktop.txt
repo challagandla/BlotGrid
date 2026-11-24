@@ -1,0 +1,7 @@
+# Desktop app (blotgrid_desktop.py). Native window via pywebview on Windows
+# (WebView2) and macOS (WebKit). Linux builds use a Chromium/Edge app window or
+# the default browser instead of bundling GTK/Qt; install pywebview[gtk] or
+# pywebview[qt] yourself for a native window on Linux.
+-r requirements.txt
+tifffile>=2023.7.10
+pywebview>=6.2,<7; sys_platform != "linux"
